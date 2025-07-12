@@ -46,6 +46,7 @@ class ImageSplitter(QWidget):
         front_panel = QVBoxLayout()
         front_panel_widget.setLayout(front_panel)
         front_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        front_panel_widget.setMinimumSize(300, 200)
         front_label = QLabel("Front Image")
         front_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         front_panel.addWidget(front_label)
@@ -63,13 +64,36 @@ class ImageSplitter(QWidget):
         front_btn.clicked.connect(self.open_front_image)
         front_panel.addWidget(front_btn)
 
-        image_layout.addWidget(front_panel_widget)
+        # Grid settings layout (vertical), with two horizontal sub-layouts
+        grid_settings_layout = QVBoxLayout()
+        self.col_spin = QSpinBox()
+        self.col_spin.setMinimum(1)
+        self.col_spin.setValue(10)
+        self.row_spin = QSpinBox()
+        self.row_spin.setMinimum(1)
+        self.row_spin.setValue(7)
+        self.col_spin.valueChanged.connect(self.update_grid_overlay)
+        self.row_spin.valueChanged.connect(self.update_grid_overlay)
+
+        col_layout = QHBoxLayout()
+        col_layout.addWidget(QLabel("Columns:"))
+        col_layout.addWidget(self.col_spin)
+        row_layout = QHBoxLayout()
+        row_layout.addWidget(QLabel("Rows:"))
+        row_layout.addWidget(self.row_spin)
+
+        grid_settings_layout.addLayout(col_layout)
+        grid_settings_layout.addLayout(row_layout)
+        front_panel.addLayout(grid_settings_layout)
+
+        image_layout.addWidget(front_panel_widget, stretch=1)
 
         # Back panel
         back_panel_widget = QWidget()
         back_panel = QVBoxLayout()
         back_panel_widget.setLayout(back_panel)
         back_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        back_panel_widget.setMinimumSize(300, 200)
         back_label = QLabel("Back Image")
         back_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         back_panel.addWidget(back_label)
@@ -91,24 +115,9 @@ class ImageSplitter(QWidget):
         back_panel.addWidget(self.use_single_back_image)
         self.use_single_back_image.stateChanged.connect(self.update_grid_overlay)
 
-        image_layout.addWidget(back_panel_widget)
+        image_layout.addWidget(back_panel_widget, stretch=1)
 
         layout.addLayout(image_layout)
-
-        grid_layout = QHBoxLayout()
-        self.col_spin = QSpinBox()
-        self.col_spin.setMinimum(1)
-        self.col_spin.setValue(10)
-        self.row_spin = QSpinBox()
-        self.row_spin.setMinimum(1)
-        self.row_spin.setValue(7)
-        self.col_spin.valueChanged.connect(self.update_grid_overlay)
-        self.row_spin.valueChanged.connect(self.update_grid_overlay)
-        grid_layout.addWidget(QLabel("Columns:"))
-        grid_layout.addWidget(self.col_spin)
-        grid_layout.addWidget(QLabel("Rows:"))
-        grid_layout.addWidget(self.row_spin)
-        layout.addLayout(grid_layout)
 
         output_btn = QPushButton("Select Output Folder")
         output_btn.clicked.connect(self.select_output_folder)
