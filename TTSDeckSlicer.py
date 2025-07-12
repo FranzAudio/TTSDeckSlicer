@@ -2,11 +2,28 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QSpinBox, QMessageBox
+    QFileDialog, QSpinBox, QMessageBox, QSizePolicy
 )
 from PyQt6.QtGui import QPixmap, QPainter, QPen
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PIL import Image
+
+class DroppableLabel(QLabel):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            file_path = urls[0].toLocalFile()
+            self.file_dropped.emit(file_path)
 
 class ImageSplitter(QWidget):
     def __init__(self):
@@ -16,29 +33,63 @@ class ImageSplitter(QWidget):
         self.back_image_path = None
         self.output_folder = None
 
+        self.front_pixmap = None
+        self.back_pixmap = None
+
         layout = QVBoxLayout()
         self.setLayout(layout)
 
         image_layout = QHBoxLayout()
-        self.front_image_label = QLabel("No front image loaded.")
-        self.front_image_label.setFixedSize(600, 400)
+
+        # Front panel
+        front_panel_widget = QWidget()
+        front_panel = QVBoxLayout()
+        front_panel_widget.setLayout(front_panel)
+        front_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        front_label = QLabel("Front Image")
+        front_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        front_panel.addWidget(front_label)
+
+        self.front_image_label = DroppableLabel("No front image loaded.")
+        self.front_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.front_image_label.setMinimumSize(300, 200)
+        self.front_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.front_image_label.setStyleSheet("border: 1px solid gray;")
         self.front_image_label.setScaledContents(False)
-        image_layout.addWidget(self.front_image_label)
-
-        self.back_image_label = QLabel("No back image loaded.")
-        self.back_image_label.setFixedSize(600, 400)
-        self.back_image_label.setScaledContents(False)
-        image_layout.addWidget(self.back_image_label)
-
-        layout.addLayout(image_layout)
+        self.front_image_label.file_dropped.connect(self.handle_front_image_drop)
+        front_panel.addWidget(self.front_image_label)
 
         front_btn = QPushButton("Load Front Image")
         front_btn.clicked.connect(self.open_front_image)
-        layout.addWidget(front_btn)
+        front_panel.addWidget(front_btn)
+
+        image_layout.addWidget(front_panel_widget)
+
+        # Back panel
+        back_panel_widget = QWidget()
+        back_panel = QVBoxLayout()
+        back_panel_widget.setLayout(back_panel)
+        back_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        back_label = QLabel("Back Image")
+        back_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        back_panel.addWidget(back_label)
+
+        self.back_image_label = DroppableLabel("No back image loaded.")
+        self.back_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.back_image_label.setMinimumSize(300, 200)
+        self.back_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.back_image_label.setStyleSheet("border: 1px solid gray;")
+        self.back_image_label.setScaledContents(False)
+        self.back_image_label.file_dropped.connect(self.handle_back_image_drop)
+        back_panel.addWidget(self.back_image_label)
 
         back_btn = QPushButton("Load Back Image")
         back_btn.clicked.connect(self.open_back_image)
-        layout.addWidget(back_btn)
+        back_panel.addWidget(back_btn)
+
+        image_layout.addWidget(back_panel_widget)
+
+        layout.addLayout(image_layout)
 
         grid_layout = QHBoxLayout()
         self.col_spin = QSpinBox()
@@ -63,47 +114,103 @@ class ImageSplitter(QWidget):
         split_btn.clicked.connect(self.split_image)
         layout.addWidget(split_btn)
 
+    def handle_front_image_drop(self, file_path):
+        self.front_image_path = file_path
+        self.front_pixmap = QPixmap(self.front_image_path)
+        self.update_grid_overlay()
+
+    def handle_back_image_drop(self, file_path):
+        self.back_image_path = file_path
+        self.back_pixmap = QPixmap(self.back_image_path)
+        self.update_grid_overlay()
+
     def open_front_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Front Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp)")
         if file_path:
             self.front_image_path = file_path
+            self.front_pixmap = QPixmap(self.front_image_path)
             self.update_grid_overlay()
 
     def open_back_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Back Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp)")
         if file_path:
             self.back_image_path = file_path
-            pixmap = QPixmap(self.back_image_path)
-            scaled_pixmap = pixmap.scaled(self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            self.back_image_label.setPixmap(scaled_pixmap)
+            self.back_pixmap = QPixmap(self.back_image_path)
+            self.update_grid_overlay()
+
+    def update_front_label_pixmap(self):
+        if self.front_pixmap:
+            scaled = self.front_pixmap.scaled(
+                self.front_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            self.front_image_label.setPixmap(scaled)
+
+    def update_back_label_pixmap(self):
+        if self.back_pixmap:
+            scaled = self.back_pixmap.scaled(
+                self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            self.back_image_label.setPixmap(scaled)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_grid_overlay()
 
     def update_grid_overlay(self):
-        if not self.front_image_path:
-            return
-        pixmap = QPixmap(self.front_image_path)
-        scaled_pixmap = pixmap.scaled(self.front_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-
         cols = self.col_spin.value()
         rows = self.row_spin.value()
-        if cols and rows:
-            overlay = QPixmap(scaled_pixmap)
-            painter = QPainter(overlay)
-            pen = QPen(Qt.GlobalColor.red)
-            pen.setWidth(1)
-            painter.setPen(pen)
+        if cols < 1 or rows < 1:
+            return
 
-            cell_width = overlay.width() / cols
-            cell_height = overlay.height() / rows
+        # Front image overlay
+        if self.front_image_path:
+            front_pixmap_orig = QPixmap(self.front_image_path)
+            scaled_front = front_pixmap_orig.scaled(self.front_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+            overlay_front = QPixmap(scaled_front)
+            painter_front = QPainter(overlay_front)
+            pen_front = QPen(Qt.GlobalColor.red)
+            pen_front.setWidth(1)
+            painter_front.setPen(pen_front)
+
+            cell_width_front = overlay_front.width() / cols
+            cell_height_front = overlay_front.height() / rows
 
             for i in range(1, cols):
-                x = round(i * cell_width)
-                painter.drawLine(x, 0, x, overlay.height())
+                x = round(i * cell_width_front)
+                painter_front.drawLine(x, 0, x, overlay_front.height())
             for j in range(1, rows):
-                y = round(j * cell_height)
-                painter.drawLine(0, y, overlay.width(), y)
+                y = round(j * cell_height_front)
+                painter_front.drawLine(0, y, overlay_front.width(), y)
 
-            painter.end()
-            self.front_image_label.setPixmap(overlay)
+            painter_front.end()
+            self.front_image_label.setPixmap(overlay_front)
+            self.front_pixmap = front_pixmap_orig
+
+        # Back image overlay
+        if self.back_image_path:
+            back_pixmap_orig = QPixmap(self.back_image_path)
+            scaled_back = back_pixmap_orig.scaled(self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+
+            overlay_back = QPixmap(scaled_back)
+            painter_back = QPainter(overlay_back)
+            pen_back = QPen(Qt.GlobalColor.red)
+            pen_back.setWidth(1)
+            painter_back.setPen(pen_back)
+
+            cell_width_back = overlay_back.width() / cols
+            cell_height_back = overlay_back.height() / rows
+
+            for i in range(1, cols):
+                x = round(i * cell_width_back)
+                painter_back.drawLine(x, 0, x, overlay_back.height())
+            for j in range(1, rows):
+                y = round(j * cell_height_back)
+                painter_back.drawLine(0, y, overlay_back.width(), y)
+
+            painter_back.end()
+            self.back_image_label.setPixmap(overlay_back)
+            self.back_pixmap = back_pixmap_orig
 
     def select_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
