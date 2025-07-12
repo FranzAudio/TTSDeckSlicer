@@ -1,0 +1,9 @@
+echo "__pycache__/
+*.pyc
+*.log
+*.app/
+dist/
+build/
+*.dmg
+.DS_Store
+DeckSlicer.icns" > .gitignore
