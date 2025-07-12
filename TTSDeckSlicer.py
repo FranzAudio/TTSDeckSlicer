@@ -2,9 +2,9 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox
+    QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen
+from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
 from PyQt6.QtCore import Qt, pyqtSignal
 from PIL import Image
 
@@ -28,13 +28,15 @@ class DroppableLabel(QLabel):
 class ImageSplitter(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Image Grid Splitter")
+        self.setWindowTitle("TTS Deck Slicer")
         self.front_image_path = None
         self.back_image_path = None
         self.output_folder = None
 
         self.front_pixmap = None
         self.back_pixmap = None
+
+        self.tile_names = {}  # key: (row, col), value: name string
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -59,6 +61,9 @@ class ImageSplitter(QWidget):
         self.front_image_label.setScaledContents(False)
         self.front_image_label.file_dropped.connect(self.handle_front_image_drop)
         front_panel.addWidget(self.front_image_label)
+
+        # Add mousePressEvent handler to front_image_label
+        self.front_image_label.mousePressEvent = self.front_image_label_mouse_press
 
         front_btn = QPushButton("Load Front Image")
         front_btn.clicked.connect(self.open_front_image)
@@ -130,6 +135,7 @@ class ImageSplitter(QWidget):
     def handle_front_image_drop(self, file_path):
         self.front_image_path = file_path
         self.front_pixmap = QPixmap(self.front_image_path)
+        self.tile_names.clear()
         self.update_grid_overlay()
 
     def handle_back_image_drop(self, file_path):
@@ -142,6 +148,7 @@ class ImageSplitter(QWidget):
         if file_path:
             self.front_image_path = file_path
             self.front_pixmap = QPixmap(self.front_image_path)
+            self.tile_names.clear()
             self.update_grid_overlay()
 
     def open_back_image(self):
@@ -216,6 +223,27 @@ class ImageSplitter(QWidget):
                 y = round(j * cell_height_front)
                 painter_front.drawLine(0, y, overlay_front.width(), y)
 
+            # Overlay tile names
+            font = QFont()
+            font.setPointSize(10)
+            font.setBold(True)
+            painter_front.setFont(font)
+            painter_front.setPen(QPen(QColor(0, 0, 255)))  # Blue color for names
+
+            for (row, col), name in self.tile_names.items():
+                if 0 <= row < rows and 0 <= col < cols:
+                    x = int(col * cell_width_front)
+                    y = int(row * cell_height_front)
+                    # Draw name in the top-left corner of the tile with some padding
+                    padding = 3
+                    rect_x = x + padding
+                    rect_y = y + padding
+                    # Draw background rectangle for readability
+                    text_rect = painter_front.boundingRect(rect_x, rect_y, int(cell_width_front), int(cell_height_front), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
+                    background_color = QColor(255, 255, 255, 180)
+                    painter_front.fillRect(text_rect, background_color)
+                    painter_front.drawText(rect_x, rect_y + text_rect.height() - padding, name)
+
             painter_front.end()
             self.front_image_label.setPixmap(overlay_front)
             self.front_pixmap = front_pixmap_orig
@@ -249,30 +277,86 @@ class ImageSplitter(QWidget):
                 self.back_image_label.setPixmap(overlay_back)
             self.back_pixmap = back_pixmap_orig
 
+    def front_image_label_mouse_press(self, event):
+        if not self.front_pixmap:
+            return
+
+        if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            cols = self.col_spin.value()
+            rows = self.row_spin.value()
+            if cols < 1 or rows < 1:
+                return
+
+            label_width = self.front_image_label.width()
+            label_height = self.front_image_label.height()
+
+            pixmap = self.front_image_label.pixmap()
+            if pixmap is None:
+                return
+
+            pixmap_width = pixmap.width()
+            pixmap_height = pixmap.height()
+
+            # Calculate top-left position of pixmap inside label (centered)
+            x_offset = (label_width - pixmap_width) / 2
+            y_offset = (label_height - pixmap_height) / 2
+
+            x = pos.x() - x_offset
+            y = pos.y() - y_offset
+
+            if x < 0 or y < 0 or x > pixmap_width or y > pixmap_height:
+                return  # Click outside image
+
+            cell_width = pixmap_width / cols
+            cell_height = pixmap_height / rows
+
+            col = int(x // cell_width)
+            row = int(y // cell_height)
+
+            # Prompt for tile name
+            current_name = self.tile_names.get((row, col), "")
+            name, ok = QInputDialog.getText(self, "Set Tile Name", f"Enter name for tile Row {row+1}, Col {col+1}:", text=current_name)
+            if ok:
+                name = name.strip()
+                if name:
+                    # Check for duplicate names
+                    if name in self.tile_names.values() and self.tile_names.get((row, col)) != name:
+                        QMessageBox.warning(self, "Duplicate Name", f"The name '{name}' is already used for another tile.")
+                        return
+                    self.tile_names[(row, col)] = name
+                else:
+                    # Remove name if empty string
+                    if (row, col) in self.tile_names:
+                        del self.tile_names[(row, col)]
+                self.update_grid_overlay()
+
     def select_output_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder:
             self.output_folder = folder
 
     def split_image(self):
-        if not self.front_image_path or not self.back_image_path or not self.output_folder:
-            QMessageBox.warning(self, "Missing Data", "Please load both front and back images and select an output folder.")
+        if not self.front_image_path or not self.output_folder:
+            QMessageBox.warning(self, "Missing Data", "Please load a front image and select an output folder.")
             return
 
         cols = self.col_spin.value()
         rows = self.row_spin.value()
 
         front_img = Image.open(self.front_image_path)
-        back_img = Image.open(self.back_image_path)
         img_width, img_height = front_img.size
         tile_width = img_width / cols
         tile_height = img_height / rows
 
-        use_single_back = self.use_single_back_image.isChecked()
-        if use_single_back:
-            back_tile = back_img
-        else:
-            back_img_full = back_img
+        has_back = bool(self.back_image_path)
+        use_single_back = self.use_single_back_image.isChecked() if has_back else False
+        if has_back:
+            back_img = Image.open(self.back_image_path)
+            if use_single_back:
+                back_tile = back_img
+            else:
+                back_img_full = back_img
 
         count = 0
         for row in range(rows):
@@ -282,24 +366,36 @@ class ImageSplitter(QWidget):
                 right = round((col + 1) * tile_width)
                 lower = round((row + 1) * tile_height)
 
-                col_str = f"{col + 1:02d}"
-                row_str = f"{row + 1:02d}"
+                # Use custom name if exists, else default
+                tile_name = self.tile_names.get((row, col))
+                if tile_name:
+                    safe_name = "".join(c for c in tile_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+                    front_filename = os.path.join(self.output_folder, f"{safe_name}[A].jpg")
+                    if has_back:
+                        back_filename = os.path.join(self.output_folder, f"{safe_name}[B].jpg")
+                else:
+                    col_str = f"{col + 1:02d}"
+                    row_str = f"{row + 1:02d}"
+                    front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].jpg")
+                    if has_back:
+                        back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].jpg")
 
                 front_tile = front_img.crop((left, upper, right, lower))
-                front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].jpg")
                 front_tile.save(front_filename, format='JPEG', quality=85)
 
-                if use_single_back:
-                    back_tile_to_save = back_tile
-                else:
-                    back_tile_to_save = back_img_full.crop((left, upper, right, lower))
-
-                back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].jpg")
-                back_tile_to_save.save(back_filename, format='JPEG', quality=85)
+                if has_back:
+                    if use_single_back:
+                        back_tile_to_save = back_tile
+                    else:
+                        back_tile_to_save = back_img_full.crop((left, upper, right, lower))
+                    back_tile_to_save.save(back_filename, format='JPEG', quality=85)
 
                 count += 1
 
-        QMessageBox.information(self, "Done", f"✅ {count * 2} tiles saved to:\n{self.output_folder}")
+        if has_back:
+            QMessageBox.information(self, "Done", f"✅ {count * 2} tiles (front & back) saved to:\n{self.output_folder}")
+        else:
+            QMessageBox.information(self, "Done", f"✅ {count} front tiles saved to:\n{self.output_folder}")
 
 if __name__ == "__main__":
     import traceback
