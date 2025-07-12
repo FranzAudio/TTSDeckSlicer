@@ -2,7 +2,7 @@ import sys
 import os
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QSpinBox, QMessageBox, QSizePolicy
+    QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox
 )
 from PyQt6.QtGui import QPixmap, QPainter, QPen
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -87,6 +87,10 @@ class ImageSplitter(QWidget):
         back_btn.clicked.connect(self.open_back_image)
         back_panel.addWidget(back_btn)
 
+        self.use_single_back_image = QCheckBox("Use same back image for all tiles")
+        back_panel.addWidget(self.use_single_back_image)
+        self.use_single_back_image.stateChanged.connect(self.update_grid_overlay)
+
         image_layout.addWidget(back_panel_widget)
 
         layout.addLayout(image_layout)
@@ -136,6 +140,26 @@ class ImageSplitter(QWidget):
         if file_path:
             self.back_image_path = file_path
             self.back_pixmap = QPixmap(self.back_image_path)
+            # --- Check if back image size matches single tile size (within ±3 pixels) ---
+            # Only if front image and grid info is available
+            if self.front_pixmap and self.front_image_path:
+                try:
+                    from PIL import Image
+                    front_img = Image.open(self.front_image_path)
+                    img_width, img_height = front_img.size
+                    cols = self.col_spin.value()
+                    rows = self.row_spin.value()
+                    if cols > 0 and rows > 0:
+                        tile_width = img_width / cols
+                        tile_height = img_height / rows
+                        # Get back image size
+                        back_img = Image.open(self.back_image_path)
+                        back_w, back_h = back_img.size
+                        # Check if within ±3 pixels
+                        if (abs(back_w - tile_width) <= 3) and (abs(back_h - tile_height) <= 3):
+                            self.use_single_back_image.setChecked(True)
+                except Exception:
+                    pass
             self.update_grid_overlay()
 
     def update_front_label_pixmap(self):
@@ -192,24 +216,28 @@ class ImageSplitter(QWidget):
             back_pixmap_orig = QPixmap(self.back_image_path)
             scaled_back = back_pixmap_orig.scaled(self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
-            overlay_back = QPixmap(scaled_back)
-            painter_back = QPainter(overlay_back)
-            pen_back = QPen(Qt.GlobalColor.red)
-            pen_back.setWidth(1)
-            painter_back.setPen(pen_back)
+            if self.use_single_back_image.isChecked():
+                # Display scaled back image without grid overlay
+                self.back_image_label.setPixmap(scaled_back)
+            else:
+                overlay_back = QPixmap(scaled_back)
+                painter_back = QPainter(overlay_back)
+                pen_back = QPen(Qt.GlobalColor.red)
+                pen_back.setWidth(1)
+                painter_back.setPen(pen_back)
 
-            cell_width_back = overlay_back.width() / cols
-            cell_height_back = overlay_back.height() / rows
+                cell_width_back = overlay_back.width() / cols
+                cell_height_back = overlay_back.height() / rows
 
-            for i in range(1, cols):
-                x = round(i * cell_width_back)
-                painter_back.drawLine(x, 0, x, overlay_back.height())
-            for j in range(1, rows):
-                y = round(j * cell_height_back)
-                painter_back.drawLine(0, y, overlay_back.width(), y)
+                for i in range(1, cols):
+                    x = round(i * cell_width_back)
+                    painter_back.drawLine(x, 0, x, overlay_back.height())
+                for j in range(1, rows):
+                    y = round(j * cell_height_back)
+                    painter_back.drawLine(0, y, overlay_back.width(), y)
 
-            painter_back.end()
-            self.back_image_label.setPixmap(overlay_back)
+                painter_back.end()
+                self.back_image_label.setPixmap(overlay_back)
             self.back_pixmap = back_pixmap_orig
 
     def select_output_folder(self):
@@ -231,6 +259,12 @@ class ImageSplitter(QWidget):
         tile_width = img_width / cols
         tile_height = img_height / rows
 
+        use_single_back = self.use_single_back_image.isChecked()
+        if use_single_back:
+            back_tile = back_img
+        else:
+            back_img_full = back_img
+
         count = 0
         for row in range(rows):
             for col in range(cols):
@@ -246,9 +280,13 @@ class ImageSplitter(QWidget):
                 front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].jpg")
                 front_tile.save(front_filename, format='JPEG', quality=85)
 
-                back_tile = back_img.crop((left, upper, right, lower))
+                if use_single_back:
+                    back_tile_to_save = back_tile
+                else:
+                    back_tile_to_save = back_img_full.crop((left, upper, right, lower))
+
                 back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].jpg")
-                back_tile.save(back_filename, format='JPEG', quality=85)
+                back_tile_to_save.save(back_filename, format='JPEG', quality=85)
 
                 count += 1
 
