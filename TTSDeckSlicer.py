@@ -1,12 +1,104 @@
 import sys
 import os
+import time
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QGuiApplication, QCursor
+from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
 from PIL import Image
+
+# --- Global key watcher to robustly track Option/Alt key state (works even without focus changes)
+class KeyWatcher(QObject):
+    def __init__(self):
+        super().__init__()
+        self.alt_down = False
+
+    def eventFilter(self, obj, event):
+        et = event.type()
+        if et == QEvent.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Alt:
+                self.alt_down = True
+        elif et == QEvent.Type.KeyRelease:
+            if event.key() == Qt.Key.Key_Alt:
+                self.alt_down = False
+            else:
+                # If another modifier was released, re-evaluate from current modifiers
+                self.alt_down = bool(QGuiApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+        return False
+
+# Global instance (created in main and installed on the app)
+_key_watcher = None  # type: ignore[assignment]
+
+def _is_alt_down() -> bool:
+    # Prefer watcher state; fall back to current keyboard modifiers
+    try:
+        if _key_watcher is not None:
+            return bool(getattr(_key_watcher, "alt_down", False))
+    except Exception:
+        pass
+    return bool(QGuiApplication.keyboardModifiers() & Qt.KeyboardModifier.AltModifier)
+
+class LensOverlay(QWidget):
+    def __init__(self):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._src = None
+        self._source_rect = QRectF()
+        self._target_size = (0.0, 0.0)
+        self._border_colors = (QColor(0, 0, 0, 200), QColor(255, 255, 255, 160))
+
+    def show_lens(self, src_pixmap: QPixmap, source_rect: QRectF, center_global: QPoint, target_w: float, target_h: float):
+        self._src = src_pixmap
+        self._source_rect = source_rect
+        self._target_size = (max(8.0, target_w), max(8.0, target_h))
+        # Clamp window inside the screen bounds
+        w = int(self._target_size[0]) + 4
+        h = int(self._target_size[1]) + 4
+        screen = QGuiApplication.screenAt(center_global)
+        if screen is None:
+            screen_geo = QGuiApplication.primaryScreen().availableGeometry()
+        else:
+            screen_geo = screen.availableGeometry()
+        x = int(center_global.x() - w / 2)
+        y = int(center_global.y() - h / 2)
+        # Clamp to screen
+        if x < screen_geo.left():
+            x = screen_geo.left()
+        if y < screen_geo.top():
+            y = screen_geo.top()
+        if x + w > screen_geo.right():
+            x = screen_geo.right() - w
+        if y + h > screen_geo.bottom():
+            y = screen_geo.bottom() - h
+        self.setGeometry(QRect(x, y, w, h))
+        if not self.isVisible():
+            self.show()
+        self.update()
+
+    def hide_lens(self):
+        if self.isVisible():
+            self.hide()
+
+    def paintEvent(self, event):
+        if self._src is None or self._source_rect.isEmpty():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        # target rect inside our tiny window (2px margin)
+        target_rect = QRectF(2, 2, self.width() - 4, self.height() - 4)
+        painter.drawPixmap(target_rect, self._src, self._source_rect)
+        # border
+        pen = QPen(self._border_colors[0]); pen.setWidth(2); painter.setPen(pen)
+        painter.drawRect(target_rect)
+        pen = QPen(self._border_colors[1]); pen.setWidth(1); painter.setPen(pen)
+        painter.drawRect(target_rect.adjusted(1, 1, -1, -1))
+        painter.end()
+
 
 class DroppableLabel(QLabel):
     file_dropped = pyqtSignal(str)
@@ -14,6 +106,48 @@ class DroppableLabel(QLabel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setAcceptDrops(True)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._source_pixmap = None
+        self._lens_base = 140  # base pixel size of the lens's longer side
+        self._lens_scale = 1.0
+        self._min_scale = 0.5
+        self._max_scale = 3.0
+        self._mouse_pos = None
+        self._lens_aspect = 1.0  # width / height of a tile
+        self._tile_cols = 1
+        self._tile_rows = 1
+        self._overlay = None
+        self._alt_grace_until = 0.0  # grace period to keep lens during wheel with Alt
+        # Timer to keep lens alive without mouse movement
+        self._lens_timer = QTimer(self)
+        self._lens_timer.setInterval(33)  # ~30 FPS
+        self._lens_timer.timeout.connect(self._on_lens_tick)
+
+    def _is_alt_active(self) -> bool:
+        return _is_alt_down() or (time.monotonic() < self._alt_grace_until)
+
+    def set_lens_aspect(self, aspect: float):
+        # guard against invalid values
+        try:
+            a = float(aspect)
+            if a <= 0:
+                a = 1.0
+            self._lens_aspect = max(0.1, min(10.0, a))
+        except Exception:
+            self._lens_aspect = 1.0
+        self.update()
+
+    def set_tile_grid(self, cols: int, rows: int):
+        try:
+            self._tile_cols = max(1, int(cols))
+            self._tile_rows = max(1, int(rows))
+        except Exception:
+            self._tile_cols, self._tile_rows = 1, 1
+        self.update()
+
+    def set_overlay(self, overlay: QWidget | None):
+        self._overlay = overlay
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -25,7 +159,168 @@ class DroppableLabel(QLabel):
             file_path = urls[0].toLocalFile()
             self.file_dropped.emit(file_path)
 
+    def set_source_pixmap(self, pixmap: QPixmap | None):
+        self._source_pixmap = pixmap
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        self._mouse_pos = event.position()
+        if not self._lens_timer.isActive():
+            self._lens_timer.start()
+        if _is_alt_down():
+            if self._overlay:
+                self._update_overlay_from_cursor()
+        else:
+            if self._overlay:
+                self._overlay.hide_lens()
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._mouse_pos = None
+        if self._overlay:
+            self._overlay.hide_lens()
+        if self._lens_timer.isActive():
+            self._lens_timer.stop()
+        self.update()
+        super().leaveEvent(event)
+
+    def enterEvent(self, event):
+        self.setFocus()
+        if not self._lens_timer.isActive():
+            self._lens_timer.start()
+        # Update once immediately (shows/hides based on current state)
+        if self._overlay:
+            self._on_lens_tick()
+        super().enterEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Alt:
+            if not self._lens_timer.isActive():
+                self._lens_timer.start()
+            # Update once immediately even if the mouse is still
+            self._on_lens_tick()
+            self._alt_grace_until = time.monotonic() + 0.5
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key.Key_Alt:
+            if self._overlay:
+                self._overlay.hide_lens()
+            if self._lens_timer.isActive():
+                self._lens_timer.stop()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _on_lens_tick(self):
+        # Keep lens visible while Alt (Option) is pressed, or within a short grace after wheel
+        alt_active = self._is_alt_active()
+        # Track current cursor position even if mouse is idle
+        global_pos = QCursor.pos()
+        local_pos = self.mapFromGlobal(global_pos)
+        self._mouse_pos = local_pos
+        # If cursor is outside this label, hide lens
+        if not self.rect().contains(local_pos):
+            if self._overlay:
+                self._overlay.hide_lens()
+            return
+        if not alt_active:
+            if self._overlay:
+                self._overlay.hide_lens()
+            return
+        self._update_overlay_from_cursor()
+
+    def _update_overlay_from_cursor(self):
+        if not self._overlay or self._mouse_pos is None:
+            return
+        if not self._is_alt_active():
+            self._overlay.hide_lens(); return
+        disp = self.pixmap(); src = self._source_pixmap or self.pixmap()
+        if disp is None or src is None:
+            self._overlay.hide_lens(); return
+        lw, lh = self.width(), self.height()
+        dw, dh = disp.width(), disp.height()
+        if dw == 0 or dh == 0:
+            self._overlay.hide_lens(); return
+        xoff = (lw - dw) / 2.0; yoff = (lh - dh) / 2.0
+        cx = float(self._mouse_pos.x()); cy = float(self._mouse_pos.y())
+        dx = cx - xoff; dy = cy - yoff
+        if dx < 0 or dy < 0 or dx > dw or dy > dh:
+            self._overlay.hide_lens(); return
+        sx_scale = src.width() / dw; sy_scale = src.height() / dh
+        sx = dx * sx_scale; sy = dy * sy_scale
+        cols = max(1, self._tile_cols); rows = max(1, self._tile_rows)
+        tile_w_src = src.width() / cols; tile_h_src = src.height() / rows
+        tile_col = int(sx // tile_w_src); tile_row = int(sy // tile_h_src)
+        tile_x = tile_col * tile_w_src; tile_y = tile_row * tile_h_src
+        source_rect = QRectF(tile_x, tile_y, tile_w_src, tile_h_src)
+        # lens target size (longer side) based on aspect and scale
+        aspect = float(self._lens_aspect) if self._lens_aspect else 1.0
+        base = float(self._lens_base) * float(self._lens_scale)
+        if aspect >= 1.0:
+            target_w = base; target_h = base / aspect
+        else:
+            target_h = base; target_w = base * aspect
+        global_center = self.mapToGlobal(QPoint(int(cx), int(cy)))
+        self._overlay.show_lens(src, source_rect, global_center, target_w, target_h)
+
+    def wheelEvent(self, event):
+        # Resize lens while Alt (Option) is held
+        mods = event.modifiers() if hasattr(event, "modifiers") else QGuiApplication.keyboardModifiers()
+        alt_now = bool(mods & Qt.KeyboardModifier.AltModifier) or _is_alt_down()
+
+        # If lens is currently visible, keep it active during the wheel event
+        if self._overlay is not None and self._overlay.isVisible():
+            alt_now = True
+
+        if alt_now:
+            dy_angle = event.angleDelta().y() if hasattr(event, "angleDelta") else 0
+            dy_pixel = 0
+            if hasattr(event, "pixelDelta"):
+                pd = event.pixelDelta()
+                dy_pixel = pd.y()
+
+            # Normalize steps: mouse wheels use 120 units per notch; trackpads often give pixel deltas
+            if dy_angle:
+                steps = dy_angle / 120.0
+            elif dy_pixel:
+                # Map pixel delta to steps; ensure at least 1 step when tiny deltas arrive
+                steps = dy_pixel / 30.0
+                if -1.0 < steps < 1.0:
+                    steps = 1.0 if dy_pixel > 0 else -1.0
+            else:
+                steps = 0.0
+
+            if steps != 0.0:
+                # Sensitivity of lens scaling per step
+                self._lens_scale = max(self._min_scale, min(self._max_scale, self._lens_scale + 0.20 * steps))
+                # Keep lens alive briefly even if Alt flickers during wheel
+                self._alt_grace_until = time.monotonic() + 0.5
+                if not self._lens_timer.isActive():
+                    self._lens_timer.start()
+                # Refresh position from the real cursor to be safe
+                self._mouse_pos = self.mapFromGlobal(QCursor.pos())
+                if self._overlay:
+                    self._update_overlay_from_cursor()
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        # Lens is drawn by floating overlay; nothing else to paint here.
+
 class ImageSplitter(QWidget):
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "_lens_overlay") and self._lens_overlay:
+                self._lens_overlay.hide_lens()
+        except Exception:
+            pass
+        super().closeEvent(event)
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TTS Deck Slicer")
@@ -132,6 +427,11 @@ class ImageSplitter(QWidget):
         split_btn.clicked.connect(self.split_image)
         layout.addWidget(split_btn)
 
+        # Shared floating lens overlay
+        self._lens_overlay = LensOverlay()
+        self.front_image_label.set_overlay(self._lens_overlay)
+        self.back_image_label.set_overlay(self._lens_overlay)
+
     def handle_front_image_drop(self, file_path):
         self.front_image_path = file_path
         self.front_pixmap = QPixmap(self.front_image_path)
@@ -160,7 +460,6 @@ class ImageSplitter(QWidget):
             # Only if front image and grid info is available
             if self.front_pixmap and self.front_image_path:
                 try:
-                    from PIL import Image
                     front_img = Image.open(self.front_image_path)
                     img_width, img_height = front_img.size
                     cols = self.col_spin.value()
@@ -199,6 +498,8 @@ class ImageSplitter(QWidget):
     def update_grid_overlay(self):
         cols = self.col_spin.value()
         rows = self.row_spin.value()
+        self.front_image_label.set_tile_grid(cols, rows)
+        self.back_image_label.set_tile_grid(cols, rows)
         if cols < 1 or rows < 1:
             return
 
@@ -215,6 +516,10 @@ class ImageSplitter(QWidget):
 
             cell_width_front = overlay_front.width() / cols
             cell_height_front = overlay_front.height() / rows
+
+            # Update lens aspect to match tile aspect ratio (width/height)
+            if cell_height_front > 0:
+                self.front_image_label.set_lens_aspect(cell_width_front / cell_height_front)
 
             for i in range(1, cols):
                 x = round(i * cell_width_front)
@@ -246,6 +551,7 @@ class ImageSplitter(QWidget):
 
             painter_front.end()
             self.front_image_label.setPixmap(overlay_front)
+            self.front_image_label.set_source_pixmap(front_pixmap_orig)
             self.front_pixmap = front_pixmap_orig
 
         # Back image overlay
@@ -253,9 +559,15 @@ class ImageSplitter(QWidget):
             back_pixmap_orig = QPixmap(self.back_image_path)
             scaled_back = back_pixmap_orig.scaled(self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
 
+            cell_width_back = scaled_back.width() / cols if cols else 0
+            cell_height_back = scaled_back.height() / rows if rows else 0
+
             if self.use_single_back_image.isChecked():
                 # Display scaled back image without grid overlay
                 self.back_image_label.setPixmap(scaled_back)
+                self.back_image_label.set_source_pixmap(back_pixmap_orig)
+                if cell_height_back > 0:
+                    self.back_image_label.set_lens_aspect(cell_width_back / cell_height_back)
             else:
                 overlay_back = QPixmap(scaled_back)
                 painter_back = QPainter(overlay_back)
@@ -275,6 +587,9 @@ class ImageSplitter(QWidget):
 
                 painter_back.end()
                 self.back_image_label.setPixmap(overlay_back)
+                self.back_image_label.set_source_pixmap(back_pixmap_orig)
+                if cell_height_back > 0:
+                    self.back_image_label.set_lens_aspect(cell_width_back / cell_height_back)
             self.back_pixmap = back_pixmap_orig
 
     def front_image_label_mouse_press(self, event):
@@ -401,6 +716,9 @@ if __name__ == "__main__":
     import traceback
     try:
         app = QApplication(sys.argv)
+        # Install global key watcher for reliable Option (Alt) detection
+        _key_watcher = KeyWatcher()
+        app.installEventFilter(_key_watcher)
         window = ImageSplitter()
         window.show()
         sys.exit(app.exec())
