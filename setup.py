@@ -2,6 +2,8 @@ from setuptools import setup
 import sys
 import traceback
 
+VERSION = "1.1"
+
 APP = ['TTSDeckSlicer.py']
 OPTIONS = {
     'argv_emulation': True,
@@ -11,6 +13,8 @@ OPTIONS = {
     'plist': {
         'CFBundleName': 'TTS Deck Slicer',
         'CFBundleIconFile': 'icon',
+        'CFBundleShortVersionString': VERSION,
+        'CFBundleVersion': VERSION,
         'NSHighResolutionCapable': True,
     }
 }

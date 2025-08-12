@@ -10,6 +10,8 @@ from PyQt6.QtGui import QGuiApplication, QCursor
 from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
 from PIL import Image
 
+__version__ = "1.1"
+
 # --- Global key watcher to robustly track Option/Alt key state (works even without focus changes)
 class KeyWatcher(QObject):
     def __init__(self):
@@ -323,7 +325,7 @@ class ImageSplitter(QWidget):
         super().closeEvent(event)
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TTS Deck Slicer")
+        self.setWindowTitle(f"TTS Deck Slicer v{__version__}")
         self.front_image_path = None
         self.back_image_path = None
         self.output_folder = None
