@@ -1,16 +1,27 @@
 import sys
 import os
 import time
+import csv
+from typing import Dict, Tuple, Optional
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
-    QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog
+    QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog,
+    QProgressBar, QProgressDialog, QMenu, QMenuBar, QMainWindow
 )
-from PyQt6.QtGui import QPixmap, QPainter, QPen, QColor, QFont
-from PyQt6.QtGui import QGuiApplication, QCursor
-from PyQt6.QtCore import Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
+from PyQt6.QtGui import (
+    QPixmap, QPainter, QPen, QColor, QFont, QGuiApplication, QCursor,
+    QKeySequence, QAction, QShortcut
+)
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
+)
 from PIL import Image
 
-__version__ = "1.1"
+from settings import Settings
+from undo_manager import UndoManager
+from ui_controls import ExportOptions
+
+__version__ = "1.2"
 
 # --- Global key watcher to robustly track Option/Alt key state (works even without focus changes)
 class KeyWatcher(QObject):
@@ -58,25 +69,19 @@ class LensOverlay(QWidget):
         self._src = src_pixmap
         self._source_rect = source_rect
         self._target_size = (max(8.0, target_w), max(8.0, target_h))
-        # Clamp window inside the screen bounds
+        # Clamp window inside the screen bounds using integer arithmetic
         w = int(self._target_size[0]) + 4
         h = int(self._target_size[1]) + 4
         screen = QGuiApplication.screenAt(center_global)
         if screen is None:
-            screen_geo = QGuiApplication.primaryScreen().availableGeometry()
-        else:
-            screen_geo = screen.availableGeometry()
+            screen = QGuiApplication.primaryScreen()
+        screen_geo = screen.availableGeometry()
+        sx, sy = screen_geo.x(), screen_geo.y()
+        sw, sh = screen_geo.width(), screen_geo.height()
         x = int(center_global.x() - w / 2)
         y = int(center_global.y() - h / 2)
-        # Clamp to screen
-        if x < screen_geo.left():
-            x = screen_geo.left()
-        if y < screen_geo.top():
-            y = screen_geo.top()
-        if x + w > screen_geo.right():
-            x = screen_geo.right() - w
-        if y + h > screen_geo.bottom():
-            y = screen_geo.bottom() - h
+        x = max(sx, min(x, sx + sw - w))
+        y = max(sy, min(y, sy + sh - h))
         self.setGeometry(QRect(x, y, w, h))
         if not self.isVisible():
             self.show()
@@ -315,135 +320,193 @@ class DroppableLabel(QLabel):
         super().paintEvent(event)
         # Lens is drawn by floating overlay; nothing else to paint here.
 
-class ImageSplitter(QWidget):
+class ImageSplitter(QMainWindow):
     def closeEvent(self, event):
         try:
             if hasattr(self, "_lens_overlay") and self._lens_overlay:
                 self._lens_overlay.hide_lens()
+            # Save settings
+            self.settings.set("window_size", (self.width(), self.height()))
+            self.settings.set("grid_cols", self.col_spin.value())
+            self.settings.set("grid_rows", self.row_spin.value())
+            self.settings.save()
         except Exception:
             pass
         super().closeEvent(event)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"TTS Deck Slicer v{__version__}")
+        
+        # Initialize settings and undo manager
+        self.settings = Settings()
+        self.undo_manager = UndoManager()
+        
+        # Restore window size
+        size = self.settings.get("window_size", (800, 600))
+        self.resize(*size)
+        
+        # Setup central widget and main layout
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        layout = QVBoxLayout(central_widget)
+        
+        # Create menu bar
+        self.create_menu_bar()
+        
+        # Setup shortcuts
+        self.setup_shortcuts()
+        
+        # Initialize member variables
         self.front_image_path = None
         self.back_image_path = None
         self.output_folder = None
-
         self.front_pixmap = None
         self.back_pixmap = None
+        self.tile_names = {}
 
-        self.tile_names = {}  # key: (row, col), value: name string
-
-        layout = QVBoxLayout()
-        self.setLayout(layout)
-
-        image_layout = QHBoxLayout()
-
-        # Front panel
-        front_panel_widget = QWidget()
-        front_panel = QVBoxLayout()
-        front_panel_widget.setLayout(front_panel)
-        front_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        front_panel_widget.setMinimumSize(300, 200)
-        front_label = QLabel("Front Image")
-        front_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        front_panel.addWidget(front_label)
-
-        self.front_image_label = DroppableLabel("No front image loaded.")
+        # Create main layout with images at top and controls at bottom
+        # Images section (takes most of the space)
+        image_section = QWidget()
+        image_section.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        image_layout = QHBoxLayout(image_section)
+        
+        # Front panel (left side)
+        front_panel = QWidget()
+        front_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        front_layout = QVBoxLayout(front_panel)
+        front_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.front_image_label = DroppableLabel("Click or drag & drop to load front image\n\nClick on a tile to name it")
         self.front_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.front_image_label.setMinimumSize(300, 200)
+        self.front_image_label.setMinimumSize(400, 300)
         self.front_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.front_image_label.setStyleSheet("border: 1px solid gray;")
-        self.front_image_label.setScaledContents(False)
+        self.front_image_label.setStyleSheet("border: 1px solid gray; border-radius: 4px;")
         self.front_image_label.file_dropped.connect(self.handle_front_image_drop)
-        front_panel.addWidget(self.front_image_label)
-
-        # Add mousePressEvent handler to front_image_label
-        self.front_image_label.mousePressEvent = self.front_image_label_mouse_press
-
-        front_btn = QPushButton("Load Front Image")
-        front_btn.clicked.connect(self.open_front_image)
-        front_panel.addWidget(front_btn)
-
-        # Grid settings layout (vertical), with two horizontal sub-layouts
-        grid_settings_layout = QVBoxLayout()
+        self.front_image_label.mousePressEvent = self.handle_front_label_click
+        front_layout.addWidget(self.front_image_label)
+        
+        image_layout.addWidget(front_panel)
+        
+        # Back panel (right side)
+        back_panel = QWidget()
+        back_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        back_layout = QVBoxLayout(back_panel)
+        back_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.back_image_label = DroppableLabel("Click or drag & drop to load back image\n(Optional)")
+        self.back_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.back_image_label.setMinimumSize(400, 300)
+        self.back_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.back_image_label.setStyleSheet("border: 1px solid gray; border-radius: 4px;")
+        self.back_image_label.file_dropped.connect(self.handle_back_image_drop)
+        self.back_image_label.mousePressEvent = self.handle_back_label_click
+        back_layout.addWidget(self.back_image_label)
+        
+        image_layout.addWidget(back_panel)
+        
+        layout.addWidget(image_section)
+        
+        # Controls section (bottom, compact layout)
+        controls_section = QWidget()
+        controls_section.setMaximumHeight(100)
+        controls_layout = QHBoxLayout(controls_section)
+        controls_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Left controls group (grid controls)
+        left_controls = QHBoxLayout()
+        
+        grid_layout = QHBoxLayout()
+        grid_layout.setSpacing(5)
+        
+        grid_layout.addWidget(QLabel("Grid:"))
+        
         self.col_spin = QSpinBox()
         self.col_spin.setMinimum(1)
-        self.col_spin.setValue(10)
+        self.col_spin.setMaximum(50)  # Add reasonable maximum
+        self.col_spin.setValue(self.settings.get("grid_cols", 10))
+        self.col_spin.valueChanged.connect(self.update_grid_overlay)
+        self.col_spin.setFixedWidth(50)
+        grid_layout.addWidget(self.col_spin)
+        
+        grid_layout.addWidget(QLabel("×"))
+        
         self.row_spin = QSpinBox()
         self.row_spin.setMinimum(1)
-        self.row_spin.setValue(7)
-        self.col_spin.valueChanged.connect(self.update_grid_overlay)
+        self.row_spin.setMaximum(50)  # Add reasonable maximum
+        self.row_spin.setValue(self.settings.get("grid_rows", 7))
         self.row_spin.valueChanged.connect(self.update_grid_overlay)
-
-        col_layout = QHBoxLayout()
-        col_layout.addWidget(QLabel("Columns:"))
-        col_layout.addWidget(self.col_spin)
-        row_layout = QHBoxLayout()
-        row_layout.addWidget(QLabel("Rows:"))
-        row_layout.addWidget(self.row_spin)
-
-        grid_settings_layout.addLayout(col_layout)
-        grid_settings_layout.addLayout(row_layout)
-        front_panel.addLayout(grid_settings_layout)
-
-        image_layout.addWidget(front_panel_widget, stretch=1)
-
-        # Back panel
-        back_panel_widget = QWidget()
-        back_panel = QVBoxLayout()
-        back_panel_widget.setLayout(back_panel)
-        back_panel_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        back_panel_widget.setMinimumSize(300, 200)
-        back_label = QLabel("Back Image")
-        back_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        back_panel.addWidget(back_label)
-
-        self.back_image_label = DroppableLabel("No back image loaded.")
-        self.back_image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.back_image_label.setMinimumSize(300, 200)
-        self.back_image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.back_image_label.setStyleSheet("border: 1px solid gray;")
-        self.back_image_label.setScaledContents(False)
-        self.back_image_label.file_dropped.connect(self.handle_back_image_drop)
-        back_panel.addWidget(self.back_image_label)
-
-        back_btn = QPushButton("Load Back Image")
-        back_btn.clicked.connect(self.open_back_image)
-        back_panel.addWidget(back_btn)
-
-        self.use_single_back_image = QCheckBox("Use same back image for all tiles")
-        back_panel.addWidget(self.use_single_back_image)
-        self.use_single_back_image.stateChanged.connect(self.update_grid_overlay)
-
-        image_layout.addWidget(back_panel_widget, stretch=1)
-
-        layout.addLayout(image_layout)
-
-        output_btn = QPushButton("Select Output Folder")
+        self.row_spin.setFixedWidth(50)
+        grid_layout.addWidget(self.row_spin)
+        
+        left_controls.addLayout(grid_layout)
+        controls_layout.addLayout(left_controls)
+        
+        # Add some spacing
+        controls_layout.addSpacing(20)
+        
+        # Right controls group (back options and export)
+        right_controls = QHBoxLayout()
+        
+        self.use_single_back_image = QCheckBox("Same back for all")
+        right_controls.addWidget(self.use_single_back_image)
+        
+        output_btn = QPushButton("Output Folder")
+        output_btn.setFixedWidth(100)
         output_btn.clicked.connect(self.select_output_folder)
-        layout.addWidget(output_btn)
-
-        split_btn = QPushButton("Split and Save")
+        right_controls.addWidget(output_btn)
+        
+        split_btn = QPushButton("Split Images")
+        split_btn.setFixedWidth(100)
         split_btn.clicked.connect(self.split_image)
-        layout.addWidget(split_btn)
-
-        # Shared floating lens overlay
+        right_controls.addWidget(split_btn)
+        
+        controls_layout.addLayout(right_controls)
+        
+        layout.addWidget(controls_section)
+        
+        # We've moved the grid controls to be more compact in the main toolbar
+        
+        # Export options
+        self.export_options = ExportOptions()
+        self.export_options.optionChanged.connect(self.update_export_options)
+        layout.addWidget(self.export_options)
+        
+        # Progress bar
+        self.progress = QProgressBar()
+        self.progress.hide()
+        layout.addWidget(self.progress)
+        
+        # Initialize lens overlay
         self._lens_overlay = LensOverlay()
         self.front_image_label.set_overlay(self._lens_overlay)
         self.back_image_label.set_overlay(self._lens_overlay)
+# Removed duplicate initialization code as it was already handled in the earlier part of __init__
+
+    def handle_front_label_click(self, event):
+        if not self.front_pixmap and event.button() == Qt.MouseButton.LeftButton:
+            # If no image loaded, handle like a load button click
+            self.open_front_image()
+        else:
+            # If image is loaded, handle normally for tile naming
+            self.front_image_label_mouse_press(event)
+
+    def handle_back_label_click(self, event):
+        if not self.back_pixmap and event.button() == Qt.MouseButton.LeftButton:
+            self.open_back_image()
 
     def handle_front_image_drop(self, file_path):
         self.front_image_path = file_path
         self.front_pixmap = QPixmap(self.front_image_path)
         self.tile_names.clear()
         self.update_grid_overlay()
+        self.front_image_label.setText("")  # Clear instruction text when image is loaded
 
     def handle_back_image_drop(self, file_path):
         self.back_image_path = file_path
         self.back_pixmap = QPixmap(self.back_image_path)
         self.update_grid_overlay()
+        self.back_image_label.setText("")  # Clear instruction text when image is loaded
 
     def open_front_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Front Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp)")
@@ -452,12 +515,14 @@ class ImageSplitter(QWidget):
             self.front_pixmap = QPixmap(self.front_image_path)
             self.tile_names.clear()
             self.update_grid_overlay()
+            self.front_image_label.setText("")  # Clear instruction text when image is loaded
 
     def open_back_image(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Back Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp)")
         if file_path:
             self.back_image_path = file_path
             self.back_pixmap = QPixmap(self.back_image_path)
+            self.back_image_label.setText("")  # Clear instruction text when image is loaded
             # --- Check if back image size matches single tile size (within ±3 pixels) ---
             # Only if front image and grid info is available
             if self.front_pixmap and self.front_image_path:
@@ -500,8 +565,244 @@ class ImageSplitter(QWidget):
     def update_grid_overlay(self):
         cols = self.col_spin.value()
         rows = self.row_spin.value()
+        
+        if cols < 1 or rows < 1:
+            return
+            
+        # Front image overlay
+        if self.front_pixmap:
+            front_pixmap_orig = self.front_pixmap
+            scaled_front = front_pixmap_orig.scaled(
+                self.front_image_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            overlay_front = QPixmap(scaled_front)
+            painter_front = QPainter(overlay_front)
+            pen_front = QPen(Qt.GlobalColor.red)
+            pen_front.setWidth(1)
+            painter_front.setPen(pen_front)
+            
+            cell_width_front = overlay_front.width() / cols
+            cell_height_front = overlay_front.height() / rows
+            
+            # Update lens aspect to match tile aspect ratio (width/height)
+            if cell_height_front > 0:
+                self.front_image_label.set_lens_aspect(cell_width_front / cell_height_front)
+            
+            # Draw grid lines
+            for i in range(1, cols):
+                x = round(i * cell_width_front)
+                painter_front.drawLine(x, 0, x, overlay_front.height())
+            for j in range(1, rows):
+                y = round(j * cell_height_front)
+                painter_front.drawLine(0, y, overlay_front.width(), y)
+                
+            # No selection highlighting needed
+            
+            # Draw tile names
+            if self.tile_names:
+                font = QFont()
+                font.setPointSize(10)
+                font.setBold(True)
+                painter_front.setFont(font)
+                painter_front.setPen(QPen(QColor(0, 0, 255)))  # Blue color for names
+                
+                for (row, col), name in self.tile_names.items():
+                    if 0 <= row < rows and 0 <= col < cols:
+                        x = int(col * cell_width_front)
+                        y = int(row * cell_height_front)
+                        padding = 3
+                        rect_x = x + padding
+                        rect_y = y + padding
+                        text_rect = painter_front.boundingRect(
+                            rect_x, rect_y, 
+                            int(cell_width_front), int(cell_height_front),
+                            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                            name
+                        )
+                        background_color = QColor(255, 255, 255, 180)
+                        painter_front.fillRect(text_rect, background_color)
+                        painter_front.drawText(rect_x, rect_y + text_rect.height() - padding, name)
+            
+            painter_front.end()
+            self.front_image_label.setPixmap(overlay_front)
+            self.front_image_label.set_source_pixmap(front_pixmap_orig)
+        
+        # Back image overlay
+        if self.back_pixmap:
+            back_pixmap_orig = self.back_pixmap
+            scaled_back = back_pixmap_orig.scaled(
+                self.back_image_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            
+            if self.use_single_back_image.isChecked():
+                # Display scaled back image without grid overlay
+                self.back_image_label.setPixmap(scaled_back)
+                self.back_image_label.set_source_pixmap(back_pixmap_orig)
+            else:
+                overlay_back = QPixmap(scaled_back)
+                painter_back = QPainter(overlay_back)
+                pen_back = QPen(Qt.GlobalColor.red)
+                pen_back.setWidth(1)
+                painter_back.setPen(pen_back)
+                
+                cell_width_back = overlay_back.width() / cols
+                cell_height_back = overlay_back.height() / rows
+                
+                # Update lens aspect to match tile aspect ratio
+                if cell_height_back > 0:
+                    self.back_image_label.set_lens_aspect(cell_width_back / cell_height_back)
+                
+                # Draw grid lines
+                for i in range(1, cols):
+                    x = round(i * cell_width_back)
+                    painter_back.drawLine(x, 0, x, overlay_back.height())
+                for j in range(1, rows):
+                    y = round(j * cell_height_back)
+                    painter_back.drawLine(0, y, overlay_back.width(), y)
+                    
+                painter_back.end()
+                self.back_image_label.setPixmap(overlay_back)
+                self.back_image_label.set_source_pixmap(back_pixmap_orig)
+        
+        # Update tile grid settings for lens overlay
         self.front_image_label.set_tile_grid(cols, rows)
         self.back_image_label.set_tile_grid(cols, rows)
+        
+        # Save grid settings
+        self.settings.set("grid_cols", cols)
+        self.settings.set("grid_rows", rows)
+
+    def undo(self):
+        if self.undo_manager.can_undo():
+            state = self.undo_manager.undo()
+            if state:
+                self.tile_names = dict(state)
+                self.update_grid_overlay()
+
+    def redo(self):
+        if self.undo_manager.can_redo():
+            state = self.undo_manager.redo()
+            if state:
+                self.tile_names = dict(state)
+                self.update_grid_overlay()
+
+    # Removed OCR-related methods
+
+    def export_names(self):
+        if not self.tile_names:
+            QMessageBox.warning(self, "No Names", "No tile names to export.")
+            return
+        
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Tile Names", "", "CSV Files (*.csv)")
+        if not path:
+            return
+            
+        try:
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Row", "Column", "Name"])
+                for (row, col), name in sorted(self.tile_names.items()):
+                    writer.writerow([row + 1, col + 1, name])
+            QMessageBox.information(self, "Success", 
+                                  "Tile names exported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", str(e))
+
+    def import_names(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Tile Names", "", "CSV Files (*.csv)")
+        if not path:
+            return
+            
+        try:
+            old_names = dict(self.tile_names)
+            self.tile_names.clear()
+            with open(path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                next(reader)  # Skip header
+                for row in reader:
+                    if len(row) >= 3:
+                        r, c, name = int(row[0]) - 1, int(row[1]) - 1, row[2]
+                        self.tile_names[(r, c)] = name
+            self.undo_manager.push("Import names", old_names, dict(self.tile_names))
+            self.update_grid_overlay()
+            QMessageBox.information(self, "Success", 
+                                  "Tile names imported successfully.")
+        except Exception as e:
+            self.tile_names = old_names
+            QMessageBox.warning(self, "Import Failed", str(e))
+
+    def save_template(self):
+        name, ok = QInputDialog.getText(
+            self, "Save Template", "Enter template name:")
+        if not ok or not name:
+            return
+            
+        template = {
+            "rows": self.row_spin.value(),
+            "cols": self.col_spin.value(),
+            "names": {f"{k[0]},{k[1]}": v for k, v in self.tile_names.items()}
+        }
+        
+        templates = self.settings.get("templates", {})
+        templates[name] = template
+        self.settings.set("templates", templates)
+        QMessageBox.information(self, "Success", 
+                              f"Template '{name}' saved successfully.")
+
+    def load_template(self):
+        templates = self.settings.get("templates", {})
+        if not templates:
+            QMessageBox.information(self, "No Templates", 
+                                  "No saved templates found.")
+            return
+            
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Load Template")
+        layout = QVBoxLayout(dialog)
+        
+        combo = QComboBox()
+        combo.addItems(sorted(templates.keys()))
+        layout.addWidget(combo)
+        
+        buttons = QHBoxLayout()
+        ok_btn = QPushButton("Load")
+        cancel_btn = QPushButton("Cancel")
+        buttons.addWidget(ok_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+        
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            name = combo.currentText()
+            template = templates[name]
+            old_state = {
+                "rows": self.row_spin.value(),
+                "cols": self.col_spin.value(),
+                "names": dict(self.tile_names)
+            }
+            
+            self.row_spin.setValue(template["rows"])
+            self.col_spin.setValue(template["cols"])
+            self.tile_names = {
+                tuple(map(int, k.split(","))): v 
+                for k, v in template["names"].items()
+            }
+            self.update_grid_overlay()
+            
+            self.undo_manager.push(
+                f"Load template '{name}'",
+                old_state["names"],
+                dict(self.tile_names)
+            )
         if cols < 1 or rows < 1:
             return
 
@@ -598,121 +899,297 @@ class ImageSplitter(QWidget):
         if not self.front_pixmap:
             return
 
-        if event.button() == Qt.MouseButton.LeftButton:
-            pos = event.position()
-            cols = self.col_spin.value()
-            rows = self.row_spin.value()
-            if cols < 1 or rows < 1:
-                return
+        cols = self.col_spin.value()
+        rows = self.row_spin.value()
+        if cols < 1 or rows < 1:
+            return
 
-            label_width = self.front_image_label.width()
-            label_height = self.front_image_label.height()
+        label_width = self.front_image_label.width()
+        label_height = self.front_image_label.height()
 
-            pixmap = self.front_image_label.pixmap()
-            if pixmap is None:
-                return
+        pixmap = self.front_image_label.pixmap()
+        if pixmap is None:
+            return
 
-            pixmap_width = pixmap.width()
-            pixmap_height = pixmap.height()
+        pixmap_width = pixmap.width()
+        pixmap_height = pixmap.height()
 
-            # Calculate top-left position of pixmap inside label (centered)
-            x_offset = (label_width - pixmap_width) / 2
-            y_offset = (label_height - pixmap_height) / 2
+        # Calculate top-left position of pixmap inside label (centered)
+        x_offset = (label_width - pixmap_width) / 2
+        y_offset = (label_height - pixmap_height) / 2
 
-            x = pos.x() - x_offset
-            y = pos.y() - y_offset
+        pos = event.position()
+        x = pos.x() - x_offset
+        y = pos.y() - y_offset
 
-            if x < 0 or y < 0 or x > pixmap_width or y > pixmap_height:
-                return  # Click outside image
+        if x < 0 or y < 0 or x > pixmap_width or y > pixmap_height:
+            return  # Click outside image
 
-            cell_width = pixmap_width / cols
-            cell_height = pixmap_height / rows
+        cell_width = pixmap_width / cols
+        cell_height = pixmap_height / rows
 
-            col = int(x // cell_width)
-            row = int(y // cell_height)
+        col = int(x // cell_width)
+        row = int(y // cell_height)
+        tile = (row, col)
 
-            # Prompt for tile name
-            current_name = self.tile_names.get((row, col), "")
-            name, ok = QInputDialog.getText(self, "Set Tile Name", f"Enter name for tile Row {row+1}, Col {col+1}:", text=current_name)
+        # Any click opens the name editor
+        if event.button() == Qt.MouseButton.LeftButton or event.button() == Qt.MouseButton.RightButton:
+            current_name = self.tile_names.get(tile, "")
+            name, ok = QInputDialog.getText(
+                self, "Set Tile Name", 
+                f"Enter name for tile Row {row+1}, Col {col+1}:",
+                text=current_name
+            )
             if ok:
                 name = name.strip()
                 if name:
-                    # Check for duplicate names
-                    if name in self.tile_names.values() and self.tile_names.get((row, col)) != name:
-                        QMessageBox.warning(self, "Duplicate Name", f"The name '{name}' is already used for another tile.")
+                    if name in self.tile_names.values() and self.tile_names.get(tile) != name:
+                        QMessageBox.warning(self, "Duplicate Name", 
+                                         f"The name '{name}' is already used for another tile.")
                         return
-                    self.tile_names[(row, col)] = name
+                    self.tile_names[tile] = name
+                    self.undo_manager.push(f"Set name for tile {row+1}-{col+1}", 
+                                        {tile: current_name} if current_name else {}, 
+                                        {tile: name})
                 else:
-                    # Remove name if empty string
-                    if (row, col) in self.tile_names:
-                        del self.tile_names[(row, col)]
-                self.update_grid_overlay()
+                    if tile in self.tile_names:
+                        old_name = self.tile_names[tile]
+                        del self.tile_names[tile]
+                        self.undo_manager.push(f"Clear name for tile {row+1}-{col+1}", 
+                                            {tile: old_name}, 
+                                            {})
+            
+            self.update_grid_overlay()
 
     def select_output_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder")
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Output Folder", 
+            self.settings.get("last_output_folder", ""))
         if folder:
             self.output_folder = folder
+            self.settings.set("last_output_folder", folder)
+            self.settings.add_recent_folder(folder)
+            self.update_recent_menu()
+            
+    def update_recent_menu(self):
+        self.recent_menu.clear()
+        for folder in self.settings.get("recent_folders", []):
+            action = self.recent_menu.addAction(folder)
+            action.triggered.connect(
+                lambda checked, f=folder: self.use_recent_folder(f))
+            
+    def use_recent_folder(self, folder):
+        if os.path.exists(folder):
+            self.output_folder = folder
+        else:
+            QMessageBox.warning(self, "Folder Not Found",
+                              f"The folder no longer exists:\n{folder}")
+            recent = self.settings.get("recent_folders", [])
+            recent.remove(folder)
+            self.settings.set("recent_folders", recent)
+            self.update_recent_menu()
+            
+    # Removed OCR and tile group management functions as they are no longer needed
 
+    def update_export_options(self, option: str, value: any):
+        if not hasattr(self, '_export_options'):
+            self._export_options = {
+                'format': 'JPEG',
+                'jpeg_quality': 85,
+                'bg_color': '#FFFFFF'
+            }
+        self._export_options[option] = value
+
+    def create_menu_bar(self):
+        menubar = self.menuBar()
+        
+        # File Menu
+        file_menu = menubar.addMenu("&File")
+        
+        open_front = QAction("Open &Front Image...", self)
+        open_front.setShortcut("Ctrl+O")
+        open_front.triggered.connect(self.open_front_image)
+        file_menu.addAction(open_front)
+        
+        open_back = QAction("Open &Back Image...", self)
+        open_back.setShortcut("Ctrl+B")
+        open_back.triggered.connect(self.open_back_image)
+        file_menu.addAction(open_back)
+        
+        file_menu.addSeparator()
+        
+        # Recent folders submenu
+        self.recent_menu = QMenu("Recent Folders", self)
+        file_menu.addMenu(self.recent_menu)
+        self.update_recent_menu()
+        
+        file_menu.addSeparator()
+        
+        save = QAction("&Save Tiles...", self)
+        save.setShortcut("Ctrl+S")
+        save.triggered.connect(self.split_image)
+        file_menu.addAction(save)
+        
+        # Edit Menu
+        edit_menu = menubar.addMenu("&Edit")
+        
+        export = QAction("Export Tile &Names...", self)
+        export.triggered.connect(self.export_names)
+        edit_menu.addAction(export)
+        
+        import_names = QAction("&Import Tile Names...", self)
+        import_names.triggered.connect(self.import_names)
+        edit_menu.addAction(import_names)
+
+    def clear_tile_names(self):
+        """Clear all tile names and update the grid overlay."""
+        if self.tile_names:
+            old_names = dict(self.tile_names)
+            self.tile_names.clear()
+            self.undo_manager.push("Clear all names", old_names, {})
+            self.update_grid_overlay()
+
+    def setup_shortcuts(self):
+        # Additional shortcuts beyond menu items
+        QShortcut(QKeySequence("Ctrl+Q"), self, self.close)
+        QShortcut(QKeySequence("Ctrl+W"), self, self.close)
+        QShortcut(QKeySequence("Ctrl+D"), self, self.clear_tile_names)
+        
     def split_image(self):
+        """
+        Main method to split and save the image tiles.
+        Handles both front and back images and saves with the specified export options.
+        """
+        # Validate required inputs
         if not self.front_image_path or not self.output_folder:
             QMessageBox.warning(self, "Missing Data", "Please load a front image and select an output folder.")
             return
 
         cols = self.col_spin.value()
         rows = self.row_spin.value()
+        total_tiles = rows * cols
 
-        front_img = Image.open(self.front_image_path)
-        img_width, img_height = front_img.size
-        tile_width = img_width / cols
-        tile_height = img_height / rows
+        try:
+            front_img = Image.open(self.front_image_path)
+            # Convert RGBA PNG to RGB if needed
+            if front_img.mode in ('RGBA', 'LA') or (front_img.mode == 'P' and 'transparency' in front_img.info):
+                background = Image.new('RGB', front_img.size, (255, 255, 255))
+                if front_img.mode == 'P':
+                    front_img = front_img.convert('RGBA')
+                background.paste(front_img, mask=front_img.split()[-1])
+                front_img = background
+            elif front_img.mode != 'RGB':
+                front_img = front_img.convert('RGB')
+                
+            img_width, img_height = front_img.size
+            tile_width = img_width / cols
+            tile_height = img_height / rows
 
-        has_back = bool(self.back_image_path)
-        use_single_back = self.use_single_back_image.isChecked() if has_back else False
-        if has_back:
-            back_img = Image.open(self.back_image_path)
-            if use_single_back:
-                back_tile = back_img
-            else:
-                back_img_full = back_img
+            has_back = bool(self.back_image_path)
+            use_single_back = self.use_single_back_image.isChecked() if has_back else False
+            if has_back:
+                back_img = Image.open(self.back_image_path)
+                # Convert back image to RGB if needed
+                if back_img.mode in ('RGBA', 'LA') or (back_img.mode == 'P' and 'transparency' in back_img.info):
+                    background = Image.new('RGB', back_img.size, (255, 255, 255))
+                    if back_img.mode == 'P':
+                        back_img = back_img.convert('RGBA')
+                    background.paste(back_img, mask=back_img.split()[-1])
+                    back_img = background
+                elif back_img.mode != 'RGB':
+                    back_img = back_img.convert('RGB')
+                
+                if use_single_back:
+                    back_tile = back_img
+                else:
+                    back_img_full = back_img
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to process images: {str(e)}\n\nMake sure the images are valid and try again.")
+            return
+
+        # Setup progress bar
+        self.progress.setRange(0, total_tiles)
+        self.progress.setValue(0)
+        self.progress.show()
+
+        # Get export format settings once
+        format_ext = self.export_options.format_btn.text().lower()
+        format_settings = {
+            'format': self.export_options.format_btn.text(),
+            'quality': self.export_options.quality_spin.value() if format_ext in ['jpeg', 'webp'] else None
+        }
+
+        save_kwargs = {'format': format_settings['format']}
+        if format_settings['quality'] is not None:
+            save_kwargs['quality'] = format_settings['quality']
 
         count = 0
-        for row in range(rows):
-            for col in range(cols):
-                left = round(col * tile_width)
-                upper = round(row * tile_height)
-                right = round((col + 1) * tile_width)
-                lower = round((row + 1) * tile_height)
+        try:
+            for row in range(rows):
+                for col in range(cols):
+                    left = int(round(col * tile_width))
+                    upper = int(round(row * tile_height))
+                    right = int(round((col + 1) * tile_width))
+                    lower = int(round((row + 1) * tile_height))
 
-                # Use custom name if exists, else default
-                tile_name = self.tile_names.get((row, col))
-                if tile_name:
-                    safe_name = "".join(c for c in tile_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                    front_filename = os.path.join(self.output_folder, f"{safe_name}[A].jpg")
-                    if has_back:
-                        back_filename = os.path.join(self.output_folder, f"{safe_name}[B].jpg")
-                else:
-                    col_str = f"{col + 1:02d}"
-                    row_str = f"{row + 1:02d}"
-                    front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].jpg")
-                    if has_back:
-                        back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].jpg")
-
-                front_tile = front_img.crop((left, upper, right, lower))
-                front_tile.save(front_filename, format='JPEG', quality=85)
-
-                if has_back:
-                    if use_single_back:
-                        back_tile_to_save = back_tile
+                    # Ensure bounds safety
+                    right = min(right, img_width)
+                    lower = min(lower, img_height)
+                    
+                    # Generate filenames
+                    tile_name = self.tile_names.get((row, col))
+                    if tile_name:
+                        safe_name = "".join(c for c in tile_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+                        front_filename = os.path.join(self.output_folder, f"{safe_name}[A].{format_ext}")
+                        if has_back:
+                            back_filename = os.path.join(self.output_folder, f"{safe_name}[B].{format_ext}")
                     else:
-                        back_tile_to_save = back_img_full.crop((left, upper, right, lower))
-                    back_tile_to_save.save(back_filename, format='JPEG', quality=85)
+                        col_str = f"{col + 1:02d}"
+                        row_str = f"{row + 1:02d}"
+                        front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].{format_ext}")
+                        if has_back:
+                            back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].{format_ext}")
 
-                count += 1
+                    # Process and save front tile
+                    front_tile = front_img.crop((left, upper, right, lower))
+                    if format_settings['format'] in ['JPEG', 'WEBP']:
+                        if front_tile.mode != 'RGB':
+                            front_tile = front_tile.convert('RGB')
+                    elif format_settings['format'] == 'PNG' and front_tile.mode == 'RGB':
+                        front_tile = front_tile.convert('RGBA')
+                    front_tile.save(front_filename, **save_kwargs)
 
-        if has_back:
-            QMessageBox.information(self, "Done", f"✅ {count * 2} tiles (front & back) saved to:\n{self.output_folder}")
-        else:
-            QMessageBox.information(self, "Done", f"✅ {count} front tiles saved to:\n{self.output_folder}")
+                    # Process and save back tile if needed
+                    if has_back:
+                        if use_single_back:
+                            back_tile_to_save = back_tile
+                        else:
+                            back_tile_to_save = back_img_full.crop((left, upper, right, lower))
+                        if format_settings['format'] in ['JPEG', 'WEBP']:
+                            if back_tile_to_save.mode != 'RGB':
+                                back_tile_to_save = back_tile_to_save.convert('RGB')
+                        elif format_settings['format'] == 'PNG' and back_tile_to_save.mode == 'RGB':
+                            back_tile_to_save = back_tile_to_save.convert('RGBA')
+                        back_tile_to_save.save(back_filename, **save_kwargs)
+
+                    count += 1
+                    self.progress.setValue(count)
+                    QApplication.processEvents()  # Keep UI responsive
+
+            # Show final success message
+            format_name = self.export_options.format_btn.text()
+            if has_back:
+                QMessageBox.information(self, "Done", 
+                    f"✅ {count * 2} tiles (front & back) saved as {format_name} to:\n{self.output_folder}")
+            else:
+                QMessageBox.information(self, "Done", 
+                    f"✅ {count} front tiles saved as {format_name} to:\n{self.output_folder}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save tiles: {str(e)}")
+        finally:
+            self.progress.hide()
+            self.progress.setValue(0)
 
 if __name__ == "__main__":
     import traceback

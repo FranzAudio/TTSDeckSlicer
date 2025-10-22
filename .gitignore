@@ -1,4 +1,4 @@
-echo "__pycache__/
+__pycache__/
 *.pyc
 *.log
 *.app/
@@ -6,4 +6,5 @@ dist/
 build/
 *.dmg
 .DS_Store
-DeckSlicer.icns" > .gitignore
+DeckSlicer.icns
+TestDir/
