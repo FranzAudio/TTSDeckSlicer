@@ -2,7 +2,7 @@ from setuptools import setup
 import sys
 import traceback
 
-VERSION = "1.1"
+VERSION = "1.2"
 
 APP = ['TTSDeckSlicer.py']
 OPTIONS = {
