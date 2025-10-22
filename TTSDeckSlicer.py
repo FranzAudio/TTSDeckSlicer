@@ -6,7 +6,7 @@ from typing import Dict, Tuple, Optional
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog,
-    QProgressBar, QProgressDialog, QMenu, QMenuBar, QMainWindow
+    QProgressBar, QProgressDialog, QMenu, QMenuBar, QMainWindow, QDialog, QComboBox
 )
 from PyQt6.QtGui import (
     QPixmap, QPainter, QPen, QColor, QFont, QGuiApplication, QCursor,
@@ -16,12 +16,203 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
 )
 from PIL import Image
+from PIL.ExifTags import TAGS
+from PIL.PngImagePlugin import PngInfo
 
 from settings import Settings
 from undo_manager import UndoManager
 from ui_controls import ExportOptions
+from browser_auth import BrowserAuth
+from arkhamdb_api import ArkhamDBAPI
 
-__version__ = "1.2"
+__version__ = "1.3"
+
+def add_card_metadata(image, card_data, format_name):
+    """Add card metadata to image based on format."""
+    if not card_data:
+        return image, None
+    
+    card_name = card_data.get('name', '')
+    card_code = card_data.get('code', '')
+    pack_name = card_data.get('pack_name', '')
+    
+    # If we only have a name (manual entry), still add it
+    if not card_code and not pack_name and card_name:
+        # This is likely a manual entry
+        if format_name.upper() == 'PNG':
+            pnginfo = PngInfo()
+            pnginfo.add_text("Title", card_name)
+            pnginfo.add_text("Card Name", card_name)
+            pnginfo.add_text("Source", "Manual Entry")
+            pnginfo.add_text("Description", f"Card: {card_name} (Manual Entry)")
+            pnginfo.add_text("Comment", f"Card: {card_name} (Manual Entry)")
+            return image, pnginfo
+        else:
+            # JPEG/WebP manual entry with comprehensive metadata
+            metadata_dict = {}
+            comment_text = f"Card: {card_name} (Manual Entry)"
+            
+            try:
+                exif_dict = image.getexif()
+                exif_dict[270] = card_name  # ImageDescription
+                exif_dict[269] = card_name  # DocumentName
+                exif_dict[37510] = comment_text.encode('utf-8')  # UserComment
+                exif_dict[315] = "TTSDeckSlicer"  # Artist
+                exif_dict[305] = "Manual Entry"  # Software maps to kMDItemCreator
+                exif_dict[40092] = comment_text.encode('utf-16le') + b'\x00\x00'  # XPComment
+                
+                exif_bytes = exif_dict.tobytes()
+                metadata_dict['exif'] = exif_bytes
+            except Exception:
+                pass
+            
+            metadata_dict['comment'] = comment_text.encode('utf-8')
+            return image, metadata_dict
+    
+    if format_name.upper() == 'PNG':
+        # PNG uses text chunks for metadata
+        pnginfo = PngInfo()
+        
+        # Add fields that macOS might recognize better
+        if card_name:
+            pnginfo.add_text("Title", card_name)  # Standard field
+            pnginfo.add_text("Card Name", card_name)
+        if card_code:
+            pnginfo.add_text("Card Code", card_code)
+        if pack_name:
+            pnginfo.add_text("Card Set", pack_name)
+        
+        # Create full description text
+        desc_parts = []
+        if card_name:
+            desc_parts.append(f"Card: {card_name}")
+        if card_code:
+            desc_parts.append(f"Code: {card_code}")
+        if pack_name:
+            desc_parts.append(f"Set: {pack_name}")
+        
+        full_description = " | ".join(desc_parts)
+        if full_description:
+            pnginfo.add_text("Description", full_description)
+            pnginfo.add_text("Comment", full_description)
+        
+        # Store additional useful info
+        if card_data.get('faction_name'):
+            pnginfo.add_text("Card Faction", card_data['faction_name'])
+        if card_data.get('type_name'):
+            pnginfo.add_text("Card Type", card_data['type_name'])
+        
+        # Add Creator field with set name
+        if pack_name:
+            pnginfo.add_text("Creator", pack_name)
+        else:
+            pnginfo.add_text("Creator", "TTSDeckSlicer")
+        
+        return image, pnginfo
+    
+    elif format_name.upper() in ['JPEG', 'WEBP']:
+        # Enhanced JPEG and WebP metadata support - match PNG comprehensiveness
+        metadata_dict = {}
+        
+        # Build comprehensive metadata text (same as PNG)
+        desc_parts = []
+        if card_name:
+            desc_parts.append(f"Card: {card_name}")
+        if card_code:
+            desc_parts.append(f"Code: {card_code}")
+        if pack_name:
+            desc_parts.append(f"Set: {pack_name}")
+        
+        full_description = " | ".join(desc_parts)
+        
+        # Add faction and type to full metadata for comprehensive storage
+        extended_parts = desc_parts.copy()
+        if card_data.get('faction_name'):
+            extended_parts.append(f"Faction: {card_data['faction_name']}")
+        if card_data.get('type_name'):
+            extended_parts.append(f"Type: {card_data['type_name']}")
+        
+        full_metadata = " | ".join(extended_parts)
+        
+        try:
+            from PIL.ExifTags import TAGS
+            
+            # Create/get EXIF dictionary
+            exif_dict = image.getexif()
+            
+            # Core fields that match PNG's Title, Card Name, Card Code, Card Set
+            if card_name:
+                # ImageDescription (270) - Primary description (put full info here for visibility)
+                exif_dict[270] = full_description  # Use full description instead of just name
+                # DocumentName (269) - Alternative title field (matches PNG Title)
+                exif_dict[269] = card_name
+                # XPTitle (40091) - Windows title field
+                exif_dict[40091] = card_name.encode('utf-16le') + b'\x00\x00'
+            
+            # Individual field storage (matches PNG's separate fields)
+            if card_code:
+                # Use Copyright field (33432) to store card code
+                exif_dict[33432] = f"Card Code: {card_code}"
+                
+            if pack_name:
+                # XPSubject (40095) - Subject field with more comprehensive info
+                subject_text = f"{pack_name} - {card_data.get('faction_name', '')} {card_data.get('type_name', '')}"
+                exif_dict[40095] = subject_text.encode('utf-16le') + b'\x00\x00'
+                
+            # Keywords field for searchability
+            keywords_list = []
+            if card_code:
+                keywords_list.append(card_code)
+            if pack_name:
+                keywords_list.append(pack_name)
+            if card_data.get('faction_name'):
+                keywords_list.append(card_data['faction_name'])
+            if card_data.get('type_name'):
+                keywords_list.append(card_data['type_name'])
+            
+            if keywords_list:
+                keywords = ";".join(keywords_list)
+                exif_dict[40094] = keywords.encode('utf-16le') + b'\x00\x00'  # XPKeywords
+            
+            # Comprehensive comment fields (matches PNG Comment/Description)
+            exif_dict[40092] = full_metadata.encode('utf-16le') + b'\x00\x00'  # XPComment (full info)
+            exif_dict[37510] = full_metadata.encode('utf-8')  # UserComment (includes faction/type)
+            
+            # Source/creator fields - Software field maps to kMDItemCreator in macOS
+            if pack_name:
+                exif_dict[305] = pack_name  # Software maps to kMDItemCreator (set name)
+                exif_dict[315] = "TTSDeckSlicer"  # Artist
+            else:
+                exif_dict[305] = "TTSDeckSlicer"  # Software (fallback)
+                exif_dict[315] = "TTSDeckSlicer"  # Artist
+            
+            # Additional fields for comprehensive storage
+            if card_data.get('faction_name'):
+                # Use Make field (271) for faction
+                exif_dict[271] = f"Faction: {card_data['faction_name']}"
+                
+            if card_code:
+                # Use Model field (272) for card code
+                exif_dict[272] = card_code
+            
+            # Convert to bytes
+            exif_bytes = exif_dict.tobytes()
+            metadata_dict['exif'] = exif_bytes
+            
+        except Exception as e:
+            print(f"EXIF creation error: {e}")
+        
+        # Also add comment as fallback (matches PNG Comment field) - use full metadata for visibility
+        metadata_dict['comment'] = full_metadata.encode('utf-8')
+        
+        # For WebP, add ICC profile if available
+        if format_name.upper() == 'WEBP':
+            if hasattr(image, 'info') and 'icc_profile' in image.info:
+                metadata_dict['icc_profile'] = image.info['icc_profile']
+        
+        return image, metadata_dict
+    
+    return image, None
 
 # --- Global key watcher to robustly track Option/Alt key state (works even without focus changes)
 class KeyWatcher(QObject):
@@ -364,6 +555,7 @@ class ImageSplitter(QMainWindow):
         self.front_pixmap = None
         self.back_pixmap = None
         self.tile_names = {}
+        self.tile_metadata = {}  # Store full card data for metadata embedding
 
         # Create main layout with images at top and controls at bottom
         # Images section (takes most of the space)
@@ -499,6 +691,7 @@ class ImageSplitter(QMainWindow):
         self.front_image_path = file_path
         self.front_pixmap = QPixmap(self.front_image_path)
         self.tile_names.clear()
+        self.tile_metadata.clear()
         self.update_grid_overlay()
         self.front_image_label.setText("")  # Clear instruction text when image is loaded
 
@@ -803,97 +996,6 @@ class ImageSplitter(QMainWindow):
                 old_state["names"],
                 dict(self.tile_names)
             )
-        if cols < 1 or rows < 1:
-            return
-
-        # Front image overlay
-        if self.front_image_path:
-            front_pixmap_orig = QPixmap(self.front_image_path)
-            scaled_front = front_pixmap_orig.scaled(self.front_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-
-            overlay_front = QPixmap(scaled_front)
-            painter_front = QPainter(overlay_front)
-            pen_front = QPen(Qt.GlobalColor.red)
-            pen_front.setWidth(1)
-            painter_front.setPen(pen_front)
-
-            cell_width_front = overlay_front.width() / cols
-            cell_height_front = overlay_front.height() / rows
-
-            # Update lens aspect to match tile aspect ratio (width/height)
-            if cell_height_front > 0:
-                self.front_image_label.set_lens_aspect(cell_width_front / cell_height_front)
-
-            for i in range(1, cols):
-                x = round(i * cell_width_front)
-                painter_front.drawLine(x, 0, x, overlay_front.height())
-            for j in range(1, rows):
-                y = round(j * cell_height_front)
-                painter_front.drawLine(0, y, overlay_front.width(), y)
-
-            # Overlay tile names
-            font = QFont()
-            font.setPointSize(10)
-            font.setBold(True)
-            painter_front.setFont(font)
-            painter_front.setPen(QPen(QColor(0, 0, 255)))  # Blue color for names
-
-            for (row, col), name in self.tile_names.items():
-                if 0 <= row < rows and 0 <= col < cols:
-                    x = int(col * cell_width_front)
-                    y = int(row * cell_height_front)
-                    # Draw name in the top-left corner of the tile with some padding
-                    padding = 3
-                    rect_x = x + padding
-                    rect_y = y + padding
-                    # Draw background rectangle for readability
-                    text_rect = painter_front.boundingRect(rect_x, rect_y, int(cell_width_front), int(cell_height_front), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, name)
-                    background_color = QColor(255, 255, 255, 180)
-                    painter_front.fillRect(text_rect, background_color)
-                    painter_front.drawText(rect_x, rect_y + text_rect.height() - padding, name)
-
-            painter_front.end()
-            self.front_image_label.setPixmap(overlay_front)
-            self.front_image_label.set_source_pixmap(front_pixmap_orig)
-            self.front_pixmap = front_pixmap_orig
-
-        # Back image overlay
-        if self.back_image_path:
-            back_pixmap_orig = QPixmap(self.back_image_path)
-            scaled_back = back_pixmap_orig.scaled(self.back_image_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-
-            cell_width_back = scaled_back.width() / cols if cols else 0
-            cell_height_back = scaled_back.height() / rows if rows else 0
-
-            if self.use_single_back_image.isChecked():
-                # Display scaled back image without grid overlay
-                self.back_image_label.setPixmap(scaled_back)
-                self.back_image_label.set_source_pixmap(back_pixmap_orig)
-                if cell_height_back > 0:
-                    self.back_image_label.set_lens_aspect(cell_width_back / cell_height_back)
-            else:
-                overlay_back = QPixmap(scaled_back)
-                painter_back = QPainter(overlay_back)
-                pen_back = QPen(Qt.GlobalColor.red)
-                pen_back.setWidth(1)
-                painter_back.setPen(pen_back)
-
-                cell_width_back = overlay_back.width() / cols
-                cell_height_back = overlay_back.height() / rows
-
-                for i in range(1, cols):
-                    x = round(i * cell_width_back)
-                    painter_back.drawLine(x, 0, x, overlay_back.height())
-                for j in range(1, rows):
-                    y = round(j * cell_height_back)
-                    painter_back.drawLine(0, y, overlay_back.width(), y)
-
-                painter_back.end()
-                self.back_image_label.setPixmap(overlay_back)
-                self.back_image_label.set_source_pixmap(back_pixmap_orig)
-                if cell_height_back > 0:
-                    self.back_image_label.set_lens_aspect(cell_width_back / cell_height_back)
-            self.back_pixmap = back_pixmap_orig
 
     def front_image_label_mouse_press(self, event):
         if not self.front_pixmap:
@@ -932,34 +1034,123 @@ class ImageSplitter(QMainWindow):
         row = int(y // cell_height)
         tile = (row, col)
 
-        # Any click opens the name editor
+        # Any click opens the name input dialog
         if event.button() == Qt.MouseButton.LeftButton or event.button() == Qt.MouseButton.RightButton:
             current_name = self.tile_names.get(tile, "")
-            name, ok = QInputDialog.getText(
-                self, "Set Tile Name", 
-                f"Enter name for tile Row {row+1}, Col {col+1}:",
-                text=current_name
-            )
-            if ok:
-                name = name.strip()
-                if name:
-                    if name in self.tile_names.values() and self.tile_names.get(tile) != name:
-                        QMessageBox.warning(self, "Duplicate Name", 
-                                         f"The name '{name}' is already used for another tile.")
-                        return
-                    self.tile_names[tile] = name
-                    self.undo_manager.push(f"Set name for tile {row+1}-{col+1}", 
-                                        {tile: current_name} if current_name else {}, 
-                                        {tile: name})
-                else:
-                    if tile in self.tile_names:
-                        old_name = self.tile_names[tile]
-                        del self.tile_names[tile]
-                        self.undo_manager.push(f"Clear name for tile {row+1}-{col+1}", 
-                                            {tile: old_name}, 
-                                            {})
+            
+            if self.use_arkhamdb_action.isChecked():
+                # Get the tile image
+                tile_image = None
+                try:
+                    if self.front_image_path:
+                        img = Image.open(self.front_image_path)
+                        img_width, img_height = img.size
+                        cols = self.col_spin.value()
+                        rows = self.row_spin.value()
+                        tile_width = img_width / cols
+                        tile_height = img_height / rows
+                        
+                        left = int(round(col * tile_width))
+                        upper = int(round(row * tile_height))
+                        right = int(round((col + 1) * tile_width))
+                        lower = int(round((row + 1) * tile_height))
+                        
+                        # Ensure bounds safety
+                        right = min(right, img_width)
+                        lower = min(lower, img_height)
+                        
+                        tile_image = img.crop((left, upper, right, lower))
+                except Exception as e:
+                    pass
+                
+                # Use ArkhamDB search dialog
+                from card_search_name_dialog import CardSearchNameDialog
+                dialog = CardSearchNameDialog(self, row, col, current_name, tile_image)
+                
+                # Variable to store the selected card data
+                selected_card_data = None
+                
+                def handle_card_selected(card_data):
+                    nonlocal selected_card_data
+                    selected_card_data = card_data
+                
+                # Connect to the cardSelected signal
+                dialog.cardSelected.connect(handle_card_selected)
+                
+                if dialog.exec() == dialog.DialogCode.Accepted and selected_card_data:
+                    name = selected_card_data.get('name')
+                    if name:
+                        if name in self.tile_names.values() and self.tile_names.get(tile) != name:
+                            QMessageBox.warning(self, "Duplicate Name", 
+                                             f"The name '{name}' is already used for another tile.")
+                            return
+                        self.tile_names[tile] = name
+                        # Store the full card metadata for embedding in images
+                        self.tile_metadata[tile] = selected_card_data
+                        self.undo_manager.push(f"Set name for tile {row+1}-{col+1}", 
+                                            {tile: current_name} if current_name else {}, 
+                                            {tile: name})
+            else:
+                # Use simple text input
+                name, ok = QInputDialog.getText(
+                    self, "Set Tile Name",
+                    f"Enter name for tile Row {row+1}, Col {col+1}:",
+                    text=current_name
+                )
+                if ok:
+                    name = name.strip()
+                    if name:
+                        if name in self.tile_names.values() and self.tile_names.get(tile) != name:
+                            QMessageBox.warning(self, "Duplicate Name",
+                                             f"The name '{name}' is already used for another tile.")
+                            return
+                        self.tile_names[tile] = name
+                        # Store minimal metadata for manual names
+                        self.tile_metadata[tile] = {'name': name}
+                        self.undo_manager.push(f"Set name for tile {row+1}-{col+1}",
+                                            {tile: current_name} if current_name else {},
+                                            {tile: name})
+                    else:
+                        if tile in self.tile_names:
+                            old_name = self.tile_names[tile]
+                            del self.tile_names[tile]
+                            # Also clear metadata
+                            if tile in self.tile_metadata:
+                                del self.tile_metadata[tile]
+                            self.undo_manager.push(f"Clear name for tile {row+1}-{col+1}",
+                                                {tile: old_name},
+                                                {})
             
             self.update_grid_overlay()
+            
+    def _toggle_arkhamdb(self, checked):
+        """Handle toggling of ArkhamDB integration"""
+        self.settings.set("use_arkhamdb", checked)
+        
+    def login_to_arkhamdb(self):
+        """Open browser for ArkhamDB login"""
+        auth = BrowserAuth(self)
+        
+        # Test authentication with a simple request
+        try:
+            if auth.authenticate():
+                api = ArkhamDBAPI()
+                api.set_browser_auth(auth)  # Pass browser auth for cookie access
+                auth.apply_to_session(api._session)
+                # Try to fetch cards to verify login
+                response = api._session.get(f"{api.BASE_URL}/cards")
+                if response.status_code == 200:
+                    QMessageBox.information(self, "Success", 
+                                      "Successfully logged in to ArkhamDB!")
+                else:
+                    QMessageBox.warning(self, "Login Failed", 
+                                  "Could not access ArkhamDB. Please try logging in again.")
+            else:
+                QMessageBox.warning(self, "Login Cancelled", 
+                              "Login process was cancelled or timed out.")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", 
+                          f"Failed to verify ArkhamDB login: {str(e)}")
 
     def select_output_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -996,6 +1187,7 @@ class ImageSplitter(QMainWindow):
             self._export_options = {
                 'format': 'JPEG',
                 'jpeg_quality': 85,
+                'webp_quality': 85,
                 'bg_color': '#FFFFFF'
             }
         self._export_options[option] = value
@@ -1040,12 +1232,32 @@ class ImageSplitter(QMainWindow):
         import_names = QAction("&Import Tile Names...", self)
         import_names.triggered.connect(self.import_names)
         edit_menu.addAction(import_names)
+        
+        edit_menu.addSeparator()
+        
+        # ArkhamDB integration toggle and settings
+        arkhamdb_menu = QMenu("ArkhamDB Integration", self)
+        
+        self.use_arkhamdb_action = QAction("Enable ArkhamDB Integration", self)
+        self.use_arkhamdb_action.setCheckable(True)
+        self.use_arkhamdb_action.setChecked(self.settings.get("use_arkhamdb", True))
+        self.use_arkhamdb_action.triggered.connect(self._toggle_arkhamdb)
+        arkhamdb_menu.addAction(self.use_arkhamdb_action)
+        
+        arkhamdb_menu.addSeparator()
+        
+        login_action = QAction("Log in to ArkhamDB...", self)
+        login_action.triggered.connect(self.login_to_arkhamdb)
+        arkhamdb_menu.addAction(login_action)
+        
+        edit_menu.addMenu(arkhamdb_menu)
 
     def clear_tile_names(self):
         """Clear all tile names and update the grid overlay."""
         if self.tile_names:
             old_names = dict(self.tile_names)
             self.tile_names.clear()
+            self.tile_metadata.clear()
             self.undo_manager.push("Clear all names", old_names, {})
             self.update_grid_overlay()
 
@@ -1114,9 +1326,17 @@ class ImageSplitter(QMainWindow):
 
         # Get export format settings once
         format_ext = self.export_options.format_btn.text().lower()
+        
+        # Get the appropriate quality setting based on format
+        quality = None
+        if format_ext == 'jpeg':
+            quality = self._export_options.get('jpeg_quality', 85)
+        elif format_ext == 'webp':
+            quality = self._export_options.get('webp_quality', 85)
+        
         format_settings = {
             'format': self.export_options.format_btn.text(),
-            'quality': self.export_options.quality_spin.value() if format_ext in ['jpeg', 'webp'] else None
+            'quality': quality
         }
 
         save_kwargs = {'format': format_settings['format']}
@@ -1157,7 +1377,40 @@ class ImageSplitter(QMainWindow):
                             front_tile = front_tile.convert('RGB')
                     elif format_settings['format'] == 'PNG' and front_tile.mode == 'RGB':
                         front_tile = front_tile.convert('RGBA')
-                    front_tile.save(front_filename, **save_kwargs)
+                    
+                    # Add metadata if available for this tile
+                    tile_key = (row, col)
+                    card_metadata = self.tile_metadata.get(tile_key)
+                    result = add_card_metadata(front_tile, card_metadata, format_settings['format'])
+                    
+                    # Handle the result safely
+                    if isinstance(result, tuple) and len(result) == 2:
+                        front_tile_with_meta, metadata = result
+                    else:
+                        front_tile_with_meta, metadata = front_tile, None
+                    
+                    # Save with metadata
+                    final_save_kwargs = dict(save_kwargs)
+                    if metadata:
+                        if format_settings['format'] == 'PNG' and isinstance(metadata, PngInfo):
+                            final_save_kwargs['pnginfo'] = metadata
+                        elif format_settings['format'] in ['JPEG', 'WEBP'] and isinstance(metadata, dict):
+                            # Enhanced metadata handling for JPEG/WebP
+                            if 'comment' in metadata:
+                                comment = metadata['comment']
+                                if isinstance(comment, str):
+                                    comment = comment.encode('utf-8')
+                                final_save_kwargs['comment'] = comment
+                            
+                            # Add EXIF data for both JPEG and WebP
+                            if 'exif' in metadata:
+                                final_save_kwargs['exif'] = metadata['exif']
+                            
+                            # Add ICC profile for WebP if available
+                            if 'icc_profile' in metadata and format_settings['format'] == 'WEBP':
+                                final_save_kwargs['icc_profile'] = metadata['icc_profile']
+                    
+                    front_tile_with_meta.save(front_filename, **final_save_kwargs)
 
                     # Process and save back tile if needed
                     if has_back:
@@ -1170,7 +1423,38 @@ class ImageSplitter(QMainWindow):
                                 back_tile_to_save = back_tile_to_save.convert('RGB')
                         elif format_settings['format'] == 'PNG' and back_tile_to_save.mode == 'RGB':
                             back_tile_to_save = back_tile_to_save.convert('RGBA')
-                        back_tile_to_save.save(back_filename, **save_kwargs)
+                        
+                        # Add same metadata to back tile
+                        back_result = add_card_metadata(back_tile_to_save, card_metadata, format_settings['format'])
+                        
+                        # Handle the result safely
+                        if isinstance(back_result, tuple) and len(back_result) == 2:
+                            back_tile_with_meta, back_metadata = back_result
+                        else:
+                            back_tile_with_meta, back_metadata = back_tile_to_save, None
+                        
+                        # Save back tile with metadata
+                        final_back_kwargs = dict(save_kwargs)
+                        if back_metadata:
+                            if format_settings['format'] == 'PNG' and isinstance(back_metadata, PngInfo):
+                                final_back_kwargs['pnginfo'] = back_metadata
+                            elif format_settings['format'] in ['JPEG', 'WEBP'] and isinstance(back_metadata, dict):
+                                # Enhanced metadata handling for JPEG/WebP back tiles
+                                if 'comment' in back_metadata:
+                                    comment = back_metadata['comment']
+                                    if isinstance(comment, str):
+                                        comment = comment.encode('utf-8')
+                                    final_back_kwargs['comment'] = comment
+                                
+                                # Add EXIF data for both JPEG and WebP
+                                if 'exif' in back_metadata:
+                                    final_back_kwargs['exif'] = back_metadata['exif']
+                                
+                                # Add ICC profile for WebP if available
+                                if 'icc_profile' in back_metadata and format_settings['format'] == 'WEBP':
+                                    final_back_kwargs['icc_profile'] = back_metadata['icc_profile']
+                        
+                        back_tile_with_meta.save(back_filename, **final_back_kwargs)
 
                     count += 1
                     self.progress.setValue(count)
@@ -1194,6 +1478,8 @@ class ImageSplitter(QMainWindow):
 if __name__ == "__main__":
     import traceback
     try:
+        # Enable WebEngine support by setting Qt attribute before QApplication creation
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
         app = QApplication(sys.argv)
         # Install global key watcher for reliable Option (Alt) detection
         _key_watcher = KeyWatcher()
@@ -1202,6 +1488,5 @@ if __name__ == "__main__":
         window.show()
         sys.exit(app.exec())
     except Exception:
-        log_path = os.path.join(os.path.expanduser("~"), "TTSDeckSlicer_error.log")
-        with open(log_path, "w") as f:
-            traceback.print_exc(file=f)
+        import traceback
+        traceback.print_exc()

@@ -14,14 +14,14 @@ class ExportOptions(QWidget):
         layout = QVBoxLayout()
         self.setLayout(layout)
         
-        # JPEG Quality
+        # Quality Control (dynamic label based on format)
         quality_layout = QHBoxLayout()
-        quality_layout.addWidget(QLabel("JPEG Quality:"))
+        self.quality_label = QLabel("JPEG Quality:")
+        quality_layout.addWidget(self.quality_label)
         self.quality_spin = QSpinBox()
         self.quality_spin.setRange(1, 100)
         self.quality_spin.setValue(85)
-        self.quality_spin.valueChanged.connect(
-            lambda v: self.optionChanged.emit("jpeg_quality", v))
+        self.quality_spin.valueChanged.connect(self._on_quality_changed)
         quality_layout.addWidget(self.quality_spin)
         layout.addLayout(quality_layout)
         
@@ -42,6 +42,9 @@ class ExportOptions(QWidget):
         self.format_btn.clicked.connect(self._show_format_menu)
         format_layout.addWidget(self.format_btn)
         layout.addLayout(format_layout)
+        
+        # Initialize quality label based on default format
+        self._update_quality_label()
 
     def _choose_color(self):
         color = QColorDialog.getColor(self.current_color, self)
@@ -53,6 +56,28 @@ class ExportOptions(QWidget):
         self.current_color = color
         self.color_btn.setStyleSheet(
             f"background-color: {color.name()}; border: 1px solid black;")
+
+    def _on_quality_changed(self, value):
+        """Handle quality control changes - emit appropriate signal based on current format"""
+        current_format = self.format_btn.text()
+        if current_format == "JPEG":
+            self.optionChanged.emit("jpeg_quality", value)
+        elif current_format == "WEBP":
+            self.optionChanged.emit("webp_quality", value)
+        # PNG doesn't use quality setting
+
+    def _update_quality_label(self):
+        """Update the quality label based on current format"""
+        current_format = self.format_btn.text()
+        if current_format == "JPEG":
+            self.quality_label.setText("JPEG Quality:")
+            self.quality_spin.setEnabled(True)
+        elif current_format == "WEBP":
+            self.quality_label.setText("WebP Quality:")
+            self.quality_spin.setEnabled(True)
+        elif current_format == "PNG":
+            self.quality_label.setText("Quality:")
+            self.quality_spin.setEnabled(False)  # PNG doesn't use quality
 
     def _show_format_menu(self):
         menu = QMenu(self)
@@ -69,4 +94,5 @@ class ExportOptions(QWidget):
             self.format_btn.rect().bottomLeft()))
         if action:
             self.format_btn.setText(action.text())
+            self._update_quality_label()  # Update label when format changes
             self.optionChanged.emit("format", action.text())

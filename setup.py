@@ -1,10 +1,9 @@
 from setuptools import setup
-import py2app
 import os
 import sys
 
 # Version and application metadata
-VERSION = "1.2"
+VERSION = "1.3"
 APP_NAME = "TTS Deck Slicer"
 
 # Validate Python version
@@ -58,5 +57,8 @@ setup(
     install_requires=[
         'PyQt6',
         'Pillow',
+        'requests',
+        # Include WebEngine to support embedded login in packaged app
+        'PyQt6-WebEngine',
     ],
 )

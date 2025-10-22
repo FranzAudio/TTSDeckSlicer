@@ -1,6 +1,33 @@
-# TTS Deck Slicer v1.2 Release Notes
+# TTS Deck Slicer v1.3 Release Notes
+
+## 🎯 Major New Features
+
+### ArkhamDB Integration
+
+- **Card Database Search**: Integrated with ArkhamDB to automatically look up card information
+- **Smart Card Naming**: Search and select cards directly from the ArkhamDB database
+- **Manual Name Fallback**: When cards aren't found in ArkhamDB, easily commit custom card names
+- **Rich Card Metadata**: Automatic retrieval of card codes, set names, factions, and types
+
+### Enhanced Metadata System
+
+- **Comprehensive Metadata Embedding**: All exported tiles now include rich metadata in PNG, JPEG, and WebP formats
+- **macOS Integration**: Card information visible in Finder's Get Info panel and searchable via Spotlight
+- **Metadata Fields Include**:
+  - **Description**: Full card details (Card: [Name] | Code: [Code] | Set: [Set])
+  - **Creator**: Set name (e.g., "Core Set", "The Dunwich Legacy")
+  - **Make**: Card faction (e.g., "Faction: Mystic")
+  - **Model**: Card code (e.g., "01001", "05003")
+- **Format-Specific Optimization**: Metadata optimized for each image format while maintaining consistency
+
+### Smart Export Controls
+
+- **Dynamic Quality Labels**: UI automatically updates quality control labels based on selected format
+- **Format-Specific Settings**: Separate quality settings for JPEG and WebP formats
+- **WebP Optimization**: Enhanced support for WebP format with superior compression and full metadata
 
 ## New Features & Improvements
+
 - Added support for more image file formats (JPEG, PNG, WebP, BMP, GIF, TIFF)
 - Streamlined user interface for better usability
 - Enhanced lens tool for easier tile preview and naming
@@ -10,11 +37,13 @@
 - Export and import functionality for tile names
 
 ## Bug Fixes
+
 - Fixed memory usage when handling large images
 - Improved error handling and user feedback
 - Enhanced stability when working with different image formats
 
 ## Technical Improvements
+
 - Code restructuring for better maintainability
 - Performance optimizations for image processing
 - Added robust keyboard shortcut support

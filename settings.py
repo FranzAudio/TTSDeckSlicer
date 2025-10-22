@@ -15,6 +15,8 @@ class Settings:
             "jpeg_quality": 85,
             "png_bg_color": "#FFFFFF",
             "recent_folders_max": 5,
+            "use_arkhamdb": True,  # Default to enabled
+
             # Removed title region settings as they are no longer used
         }
         self.data = self.load()

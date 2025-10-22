@@ -6,8 +6,8 @@ PYTHON = $(VENV)/bin/python3
 PIP = $(VENV)/bin/pip
 
 # Application metadata
-APP_NAME = "TTS Deck Slicer"
-VERSION = 1.1
+APP_NAME = TTS Deck Slicer
+VERSION = 1.3
 
 all: venv clean build sign dmg
 
@@ -38,5 +38,5 @@ sign:
 	codesign --force --deep --sign - "dist/$(APP_NAME).app"
 
 dmg:
-	hdiutil create -volname "$(APP_NAME)" -srcfolder dist/$(APP_NAME).app \
+	hdiutil create -volname "$(APP_NAME)" -srcfolder "dist/$(APP_NAME).app" \
 		-ov -format UDZO "dist/$(APP_NAME)-$(VERSION).dmg"
