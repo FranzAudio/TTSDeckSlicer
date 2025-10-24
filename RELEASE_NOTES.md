@@ -1,4 +1,4 @@
-# TTS Deck Slicer v1.3 Release Notes
+# TTS Deck Slicer v1.4 Release Notes
 
 ## 🎯 Major New Features
 
@@ -28,6 +28,10 @@
 
 ## New Features & Improvements
 
+- **Customizable File Suffixes**: Added suffix input fields below each image panel for custom filename suffixes (defaults: "[A]" for front, "[B]" for back)
+- **Card Code Prefix Option**: New checkbox in ArkhamDB search dialog to include card code as filename prefix (e.g., "01001 Agnes Baker" instead of just "Agnes Baker")
+- **Encounter Card Support**: Added support for encounter cards, enemies, and scenarios via the `encounter=1` API parameter with toggle checkbox
+- **Output Folder Drag & Drop**: The Output Folder button now accepts folder drops from Finder and updates recent folders automatically
 - Added support for more image file formats (JPEG, PNG, WebP, BMP, GIF, TIFF)
 - Streamlined user interface for better usability
 - Enhanced lens tool for easier tile preview and naming
@@ -35,6 +39,7 @@
 - Added Save and Load Template functionality for reusable grid configurations
 - Recent folders list for quicker access to frequently used output directories
 - Export and import functionality for tile names
+- Settings persistence for all user preferences
 
 ## Bug Fixes
 

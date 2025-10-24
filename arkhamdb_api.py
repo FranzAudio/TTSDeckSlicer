@@ -1,28 +1,32 @@
-import requests
-from typing import Dict, List, Optional
+import logging
 import time
+import threading
+from typing import Dict, List, Optional
+
+import requests
 
 class ArkhamDBAPI:
     """Interface to the ArkhamDB API for fetching card information."""
     
     BASE_URL = "https://arkhamdb.com/api/public"
     
-    def __init__(self):
-        self._cards_cache: Dict[str, dict] = {}
-        self._all_cards_cache: Optional[List[dict]] = None
-        self._last_request_time = 0
-        self._min_request_interval = 0.5  # 500ms between requests to be extra polite
-        self._session = requests.Session()  # Use session to maintain cookies
-        self._browser_auth = None  # Browser authentication for cookie access
-        
+    # Shared caches across all instances to avoid repeated loads
+    _shared_cards_cache: Dict[str, dict] = {}
+    _shared_all_cards_cache: Optional[List[dict]] = None
+    _shared_search_index: List[dict] = []
+    _shared_index_by_code: Dict[str, dict] = {}
+    _shared_loading = False
+    _cache_lock = threading.Lock()
+    _logger = logging.getLogger(__name__)
 
-        
-    def set_browser_auth(self, browser_auth):
-        """Set the browser authentication object for cookie access."""
-        self._browser_auth = browser_auth
-        # Clear caches to force reload with authentication
-        self._cards_cache.clear()
-        self._all_cards_cache = None
+    def __init__(self):
+        self._cards_cache = ArkhamDBAPI._shared_cards_cache
+        self._all_cards_cache = ArkhamDBAPI._shared_all_cards_cache
+        self._search_index: List[dict] = ArkhamDBAPI._shared_search_index
+        self._index_by_code: Dict[str, dict] = ArkhamDBAPI._shared_index_by_code
+        self._last_request_time = 0
+        self._min_request_interval = 0.1  # 100ms between requests - reasonable for public API
+        self._session = requests.Session()  # Use session to maintain cookies
         
     def _rate_limit(self):
         """Ensure we don't make requests too quickly."""
@@ -37,80 +41,100 @@ class ArkhamDBAPI:
         if code in self._cards_cache:
             return self._cards_cache[code]
             
-        # Try all possible endpoints to get the card
+        # Try different endpoints to get the card
+        # Start with the most likely to succeed
         endpoints = [
-            f"{self.BASE_URL}/card/{code}",  # Standard endpoint
-            f"{self.BASE_URL}/card/encounter/{code}",  # Encounter card endpoint
-            f"{self.BASE_URL}/card/player/{code}"  # Player card endpoint
+            f"{self.BASE_URL}/card/{code}",  # Standard endpoint (should work for both player and encounter)
+            f"{self.BASE_URL}/card/{code}?encounter=1",  # Explicitly request encounter cards
         ]
         
         for endpoint in endpoints:
             self._rate_limit()
             try:
                 headers = {
-                    'User-Agent': 'TTSDeckSlicer/1.3',
+                    'User-Agent': 'TTSDeckSlicer/1.4',
                     'Accept': 'application/json'
                 }
-                response = requests.get(endpoint, headers=headers)
+                
+                response = self._session.get(endpoint, headers=headers)
                 if response.status_code == 200:
                     card = response.json()
                     self._cards_cache[code] = card
                     return card
             except Exception as e:
-                pass
                 continue
                 
         return None
 
     def _ensure_cards_loaded(self) -> bool:
         """Make sure we have the full card list loaded."""
-        if self._all_cards_cache is not None:
+        if ArkhamDBAPI._shared_all_cards_cache is not None:
+            self._sync_shared_references()
             return True
+
+        # Acquire lock to ensure a single loader at a time
+        with ArkhamDBAPI._cache_lock:
+            if ArkhamDBAPI._shared_all_cards_cache is not None:
+                self._sync_shared_references()
+                return True
+            if ArkhamDBAPI._shared_loading:
+                # Another thread is already loading
+                return False
+            ArkhamDBAPI._shared_loading = True
+
+        try:
+            success = self._load_all_cards()
+            if success:
+                self._sync_shared_references()
+            return success
+        finally:
+            with ArkhamDBAPI._cache_lock:
+                ArkhamDBAPI._shared_loading = False
+    
+    def _load_all_cards(self) -> bool:
+        """Internal method to load all cards from API."""
+        self._rate_limit()
+        
+        # Try to get all cards in one request first (most efficient)
+        try:
+            headers = {
+                'User-Agent': 'TTSDeckSlicer/1.4',
+                'Accept': 'application/json'
+            }
             
+            # Try getting all cards with encounter=1 parameter - returns everything
+            response = self._session.get(f"{self.BASE_URL}/cards?encounter=1", headers=headers, timeout=10)
+            if response.status_code == 200:
+                all_cards = response.json()
+                if isinstance(all_cards, list) and len(all_cards) > 0:
+                    self._set_shared_data(all_cards)
+                    print(f"Loaded {len(all_cards)} cards from ArkhamDB")
+                    return True
+        except Exception as e:
+            print(f"Failed to load all cards: {e}")
+        
+        # Fallback: try separate endpoints
         self._rate_limit()
         cards = []
         
-        # Try different endpoint strategies based on availability
         endpoints = [
-            (f"{self.BASE_URL}/cards", "public cards"),
-            # These endpoints seem to return empty responses, try alternatives
-            # (f"{self.BASE_URL}/cards/encounter", "encounter cards"),
-            # (f"{self.BASE_URL}/cards/player", "player cards")
+            (f"{self.BASE_URL}/cards", "player cards"),
+            (f"{self.BASE_URL}/cards?encounter=1", "encounter cards"),
         ]
-        
-        # If we have authentication, try the full card database endpoint
-        if self._browser_auth and hasattr(self._browser_auth, 'cookies') and self._browser_auth.cookies:
-            # Try authenticated endpoints that might include spoiler cards
-            auth_endpoints = [
-                (f"{self.BASE_URL}/cards?include_spoilers=1", "authenticated cards with spoilers"),
-                ("https://arkhamdb.com/api/public/card", "all cards endpoint")  # Different base
-            ]
-            endpoints.extend(auth_endpoints)
         
         for endpoint, desc in endpoints:
             self._rate_limit()
-
             try:
-                # Add browser-like headers to mimic real browser behavior
                 headers = {
-                    'Referer': 'https://arkhamdb.com',
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br'
+                    'User-Agent': 'TTSDeckSlicer/1.4',
+                    'Accept': 'application/json'
                 }
                 
-                # Add authentication cookies if available
-                if self._browser_auth and hasattr(self._browser_auth, 'cookies') and self._browser_auth.cookies:
-                    cookie_header = '; '.join([f"{name}={value}" for name, value in self._browser_auth.cookies.items()])
-                    headers['Cookie'] = cookie_header
-                
-                response = self._session.get(endpoint, headers=headers)
+                response = self._session.get(endpoint, headers=headers, timeout=10)
                 if response.status_code == 200:
                     try:
                         endpoint_cards = response.json()
                         if isinstance(endpoint_cards, list):
-                            # Only merge if we got a valid list
                             if not cards:  # First valid response
                                 cards = endpoint_cards
                             else:
@@ -119,71 +143,165 @@ class ArkhamDBAPI:
                                 cards.extend(card for card in endpoint_cards 
                                            if card.get('code') not in existing_codes)
                     except ValueError:
-                        # Skip endpoints that return invalid JSON
                         continue
             except Exception:
                 continue
-                continue
 
         if cards:
-            self._all_cards_cache = cards
-            # Update the card cache with individual cards
-            for card in self._all_cards_cache:
-                if 'code' in card:
-                    self._cards_cache[card['code']] = card
+            self._set_shared_data(cards)
+            print(f"Loaded {len(cards)} cards from ArkhamDB")
             return True
             
         return False
     
-    def search_cards(self, query: str) -> List[dict]:
-        """
-        Search for cards by name, code, text, or traits.
-        Returns a list of matching cards with all their information.
-        """
+    def _set_shared_data(self, cards: List[dict]):
+        """Update shared caches and search index with freshly loaded data."""
+        search_index = self._build_search_index(cards)
+        with ArkhamDBAPI._cache_lock:
+            ArkhamDBAPI._shared_all_cards_cache = cards
+            ArkhamDBAPI._shared_cards_cache = {
+                card['code']: card for card in cards if card.get('code')
+            }
+            ArkhamDBAPI._shared_search_index = search_index
+            ArkhamDBAPI._shared_index_by_code = {
+                entry['card'].get('code'): entry
+                for entry in search_index
+                if entry['card'].get('code')
+            }
+        self._sync_shared_references()
+
+    def _sync_shared_references(self):
+        """Sync instance references with shared caches."""
+        self._all_cards_cache = ArkhamDBAPI._shared_all_cards_cache
+        self._cards_cache = ArkhamDBAPI._shared_cards_cache
+        self._search_index = ArkhamDBAPI._shared_search_index
+        self._index_by_code = ArkhamDBAPI._shared_index_by_code
+
+    def _build_search_index(self, cards: List[dict]) -> List[dict]:
+        """Create a pre-normalized index to speed up searches."""
+        index: List[dict] = []
+        for card in cards:
+            entry = {
+                'card': card,
+                'name': (card.get('name') or '').lower(),
+                'code': (card.get('code') or '').lower(),
+                'subname': (card.get('subname') or '').lower(),
+                'traits': (card.get('traits') or '').lower(),
+                'text': (card.get('text') or '').lower(),
+                'is_encounter': self._is_encounter_card(card),
+            }
+            index.append(entry)
+        return index
+
+    def search_cards(self, query: str, limit: Optional[int] = None, include_encounter: bool = True) -> List[dict]:
+        """Search for cards by relevance with optional limit."""
         if not self._ensure_cards_loaded():
             return []
-            
-        query = query.lower()
-        return [
-            card for card in self._all_cards_cache
-            if (query in card.get('name', '').lower() or
-                query in card.get('code', '').lower() or
-                query in card.get('traits', '').lower() or
-                query in card.get('text', '').lower() or
-                query in card.get('subname', '').lower())
-        ]
+
+        index = self._search_index or []
+        if not index:
+            return []
+
+        query = (query or "").strip().lower()
+        if not query:
+            return []
+
+        if not limit or limit <= 0:
+            limit = len(index)
+        include_text = len(query) >= 3
+
+        exact_matches: List[dict] = []
+        prefix_matches: List[dict] = []
+        subname_matches: List[dict] = []
+        contains_matches: List[dict] = []
+        traits_matches: List[dict] = []
+        text_matches: List[dict] = []
+
+        scanned = 0
+        start_time = time.perf_counter()
+        total = 0
+
+        for entry in index:
+            if not include_encounter and entry['is_encounter']:
+                continue
+
+            card = entry['card']
+            name = entry['name']
+            code = entry['code']
+            subname = entry['subname']
+            traits = entry['traits']
+            text = entry['text']
+
+            scanned += 1
+
+            if query == name or query == code:
+                exact_matches.append(card)
+                total += 1
+            elif name.startswith(query) or code.startswith(query):
+                prefix_matches.append(card)
+                total += 1
+            elif subname and (subname == query or subname.startswith(query)):
+                subname_matches.append(card)
+                total += 1
+            elif (query in name or query in code or (subname and query in subname)):
+                contains_matches.append(card)
+                total += 1
+            elif traits and query in traits:
+                traits_matches.append(card)
+                total += 1
+            elif (include_text and total < limit and text and query in text):
+                text_matches.append(card)
+                total += 1
+            else:
+                continue
+
+            if total >= limit:
+                break
+
+        combined = (exact_matches + prefix_matches + subname_matches +
+                    contains_matches + traits_matches + text_matches)
+        if limit and len(combined) > limit:
+            combined = combined[:limit]
+
+        duration_ms = (time.perf_counter() - start_time) * 1000.0
+        log_level = logging.INFO if duration_ms > 50 else logging.DEBUG
+        ArkhamDBAPI._logger.log(
+            log_level,
+            "search_cards query='%s' matches=%d scanned=%d limit=%d duration=%.1fms",
+            query,
+            len(combined),
+            scanned,
+            limit,
+            duration_ms,
+        )
+        return combined
     
-    def get_card_name_suggestions(self, partial_name: str, limit: int = 200) -> List[dict]:
+    def get_card_name_suggestions(self, partial_name: str, limit: int = 200, include_encounter: bool = True) -> List[dict]:
         """
         Get card name suggestions for autocomplete.
         Returns up to 200 matches by default, sorted by relevance.
+        
+        Args:
+            partial_name: The partial name to search for
+            limit: Maximum number of results to return
+            include_encounter: Whether to include encounter cards in results
         """
-        results = self.search_cards(partial_name)
-        # Sort by relevance - exact matches first, then startswith, then contains
-        partial_name = partial_name.lower()
-        def sort_key(card):
-            name = card.get('name', '').lower()
-            code = card.get('code', '').lower()
-            subname = card.get('subname', '').lower()
-            
-            # Exact matches get highest priority
-            if name == partial_name or code == partial_name:
-                return (0, name)
-            # Then names/codes that start with the query
-            elif name.startswith(partial_name) or code.startswith(partial_name):
-                return (1, name)
-            # Then subnames that contain the query
-            elif subname and partial_name in subname:
-                return (2, name)
-            # Then names/codes that contain the query
-            elif partial_name in name or partial_name in code:
-                return (3, name)
-            # Finally, text/traits matches
-            else:
-                return (4, name)
-                
-        results.sort(key=sort_key)
+        results = self.search_cards(partial_name, limit=limit, include_encounter=include_encounter)
         return results[:limit]
+    
+    def _is_encounter_card(self, card: dict) -> bool:
+        """Check if a card is an encounter card."""
+        # Encounter cards typically have different faction codes or types
+        faction = card.get('faction_code', '')
+        type_code = card.get('type_code', '')
+        
+        # Common encounter card indicators
+        encounter_factions = ['mythos', 'neutral']  # Common encounter factions
+        encounter_types = ['enemy', 'treachery', 'location', 'agenda', 'act', 'scenario']
+        
+        return (faction in encounter_factions and type_code in encounter_types) or \
+               card.get('encounter_code') is not None or \
+               card.get('encounter_position') is not None
         
     def get_card_details(self, code: str) -> Optional[dict]:
         """

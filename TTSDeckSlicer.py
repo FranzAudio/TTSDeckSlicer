@@ -2,11 +2,12 @@ import sys
 import os
 import time
 import csv
-from typing import Dict, Tuple, Optional
+import re
+import logging
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QLabel, QVBoxLayout, QHBoxLayout,
     QFileDialog, QSpinBox, QMessageBox, QSizePolicy, QCheckBox, QInputDialog,
-    QProgressBar, QProgressDialog, QMenu, QMenuBar, QMainWindow, QDialog, QComboBox
+    QProgressBar, QMenu, QMainWindow, QDialog, QComboBox, QLineEdit
 )
 from PyQt6.QtGui import (
     QPixmap, QPainter, QPen, QColor, QFont, QGuiApplication, QCursor,
@@ -16,16 +17,14 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal, QRectF, QPoint, QRect, QTimer, QObject, QEvent
 )
 from PIL import Image
-from PIL.ExifTags import TAGS
 from PIL.PngImagePlugin import PngInfo
 
 from settings import Settings
 from undo_manager import UndoManager
 from ui_controls import ExportOptions
-from browser_auth import BrowserAuth
 from arkhamdb_api import ArkhamDBAPI
 
-__version__ = "1.3"
+__version__ = "1.4"
 
 def add_card_metadata(image, card_data, format_name):
     """Add card metadata to image based on format."""
@@ -511,6 +510,36 @@ class DroppableLabel(QLabel):
         super().paintEvent(event)
         # Lens is drawn by floating overlay; nothing else to paint here.
 
+
+class FolderDropButton(QPushButton):
+    """Push button that accepts folder drops and emits the folder path."""
+
+    folderDropped = pyqtSignal(str)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and os.path.isdir(path):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+    def dropEvent(self, event):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path and os.path.isdir(path):
+                    self.folderDropped.emit(path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+
 class ImageSplitter(QMainWindow):
     def closeEvent(self, event):
         try:
@@ -520,6 +549,8 @@ class ImageSplitter(QMainWindow):
             self.settings.set("window_size", (self.width(), self.height()))
             self.settings.set("grid_cols", self.col_spin.value())
             self.settings.set("grid_rows", self.row_spin.value())
+            self.settings.set("front_suffix", self.front_suffix_input.text())
+            self.settings.set("back_suffix", self.back_suffix_input.text())
             self.settings.save()
         except Exception:
             pass
@@ -532,22 +563,22 @@ class ImageSplitter(QMainWindow):
         # Initialize settings and undo manager
         self.settings = Settings()
         self.undo_manager = UndoManager()
-        
+
         # Restore window size
         size = self.settings.get("window_size", (800, 600))
         self.resize(*size)
-        
+
         # Setup central widget and main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        
+
         # Create menu bar
         self.create_menu_bar()
-        
+
         # Setup shortcuts
         self.setup_shortcuts()
-        
+
         # Initialize member variables
         self.front_image_path = None
         self.back_image_path = None
@@ -556,6 +587,7 @@ class ImageSplitter(QMainWindow):
         self.back_pixmap = None
         self.tile_names = {}
         self.tile_metadata = {}  # Store full card data for metadata embedding
+        self._last_failed_tile = None
 
         # Create main layout with images at top and controls at bottom
         # Images section (takes most of the space)
@@ -578,6 +610,16 @@ class ImageSplitter(QMainWindow):
         self.front_image_label.mousePressEvent = self.handle_front_label_click
         front_layout.addWidget(self.front_image_label)
         
+        # Front suffix input
+        front_suffix_layout = QHBoxLayout()
+        front_suffix_layout.addWidget(QLabel("Front Suffix:"))
+        self.front_suffix_input = QLineEdit(self.settings.get("front_suffix", "[A]"))
+        self.front_suffix_input.setMaximumWidth(100)
+        self.front_suffix_input.setToolTip("Suffix added to front image filenames")
+        front_suffix_layout.addWidget(self.front_suffix_input)
+        front_suffix_layout.addStretch()
+        front_layout.addLayout(front_suffix_layout)
+        
         image_layout.addWidget(front_panel)
         
         # Back panel (right side)
@@ -594,6 +636,16 @@ class ImageSplitter(QMainWindow):
         self.back_image_label.file_dropped.connect(self.handle_back_image_drop)
         self.back_image_label.mousePressEvent = self.handle_back_label_click
         back_layout.addWidget(self.back_image_label)
+        
+        # Back suffix input
+        back_suffix_layout = QHBoxLayout()
+        back_suffix_layout.addWidget(QLabel("Back Suffix:"))
+        self.back_suffix_input = QLineEdit(self.settings.get("back_suffix", "[B]"))
+        self.back_suffix_input.setMaximumWidth(100)
+        self.back_suffix_input.setToolTip("Suffix added to back image filenames")
+        back_suffix_layout.addWidget(self.back_suffix_input)
+        back_suffix_layout.addStretch()
+        back_layout.addLayout(back_suffix_layout)
         
         image_layout.addWidget(back_panel)
         
@@ -643,10 +695,12 @@ class ImageSplitter(QMainWindow):
         self.use_single_back_image = QCheckBox("Same back for all")
         right_controls.addWidget(self.use_single_back_image)
         
-        output_btn = QPushButton("Output Folder")
-        output_btn.setFixedWidth(100)
-        output_btn.clicked.connect(self.select_output_folder)
-        right_controls.addWidget(output_btn)
+        self.output_folder_button = FolderDropButton("Output Folder")
+        self.output_folder_button.setFixedWidth(120)
+        self.output_folder_button.setToolTip("Click or drop a folder to use as the output location.")
+        self.output_folder_button.clicked.connect(self.select_output_folder)
+        self.output_folder_button.folderDropped.connect(self.handle_output_folder_drop)
+        right_controls.addWidget(self.output_folder_button)
         
         split_btn = QPushButton("Split Images")
         split_btn.setFixedWidth(100)
@@ -673,7 +727,39 @@ class ImageSplitter(QMainWindow):
         self._lens_overlay = LensOverlay()
         self.front_image_label.set_overlay(self._lens_overlay)
         self.back_image_label.set_overlay(self._lens_overlay)
-# Removed duplicate initialization code as it was already handled in the earlier part of __init__
+
+        initial_folder = self.settings.get("last_output_folder")
+        if initial_folder and os.path.isdir(initial_folder):
+            self._set_output_folder(initial_folder, record_recent=False, announce=False)
+        else:
+            self._update_output_folder_button(None)
+
+    def _sanitize_tile_name(self, raw_name: str, fallback: str) -> str:
+        allowed = set(" ._-!'?,()[]")
+        sanitized = "".join(c for c in raw_name if c.isalnum() or c in allowed)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        sanitized = sanitized.rstrip('.')
+        return sanitized or fallback
+
+    def _name_conflicts(self, tile, name, new_metadata):
+        """Check if assigning the given name should be blocked for the tile."""
+        new_metadata = new_metadata or {}
+        new_code = new_metadata.get('code')
+
+        for other_tile, existing_name in self.tile_names.items():
+            if other_tile == tile:
+                continue
+            if existing_name != name:
+                continue
+
+            existing_meta = self.tile_metadata.get(other_tile, {}) or {}
+            existing_code = existing_meta.get('code')
+
+            # If either entry lacks a code or both codes match, treat as conflict
+            if not new_code or not existing_code or existing_code == new_code:
+                return True
+
+        return False
 
     def handle_front_label_click(self, event):
         if not self.front_pixmap and event.button() == Qt.MouseButton.LeftButton:
@@ -1067,6 +1153,10 @@ class ImageSplitter(QMainWindow):
                 from card_search_name_dialog import CardSearchNameDialog
                 dialog = CardSearchNameDialog(self, row, col, current_name, tile_image)
                 
+                # Set checkbox states from settings
+                dialog.include_code_checkbox.setChecked(self.settings.get("include_card_code", True))
+                dialog.include_encounter_checkbox.setChecked(self.settings.get("include_encounter_cards", True))
+                
                 # Variable to store the selected card data
                 selected_card_data = None
                 
@@ -1078,9 +1168,13 @@ class ImageSplitter(QMainWindow):
                 dialog.cardSelected.connect(handle_card_selected)
                 
                 if dialog.exec() == dialog.DialogCode.Accepted and selected_card_data:
+                    # Save checkbox states to settings
+                    self.settings.set("include_card_code", dialog.include_code_checkbox.isChecked())
+                    self.settings.set("include_encounter_cards", dialog.include_encounter_checkbox.isChecked())
+                    
                     name = selected_card_data.get('name')
                     if name:
-                        if name in self.tile_names.values() and self.tile_names.get(tile) != name:
+                        if self._name_conflicts(tile, name, selected_card_data):
                             QMessageBox.warning(self, "Duplicate Name", 
                                              f"The name '{name}' is already used for another tile.")
                             return
@@ -1100,13 +1194,14 @@ class ImageSplitter(QMainWindow):
                 if ok:
                     name = name.strip()
                     if name:
-                        if name in self.tile_names.values() and self.tile_names.get(tile) != name:
+                        metadata = {'name': name}
+                        if self._name_conflicts(tile, name, metadata):
                             QMessageBox.warning(self, "Duplicate Name",
                                              f"The name '{name}' is already used for another tile.")
                             return
                         self.tile_names[tile] = name
                         # Store minimal metadata for manual names
-                        self.tile_metadata[tile] = {'name': name}
+                        self.tile_metadata[tile] = metadata
                         self.undo_manager.push(f"Set name for tile {row+1}-{col+1}",
                                             {tile: current_name} if current_name else {},
                                             {tile: name})
@@ -1126,71 +1221,90 @@ class ImageSplitter(QMainWindow):
     def _toggle_arkhamdb(self, checked):
         """Handle toggling of ArkhamDB integration"""
         self.settings.set("use_arkhamdb", checked)
-        
-    def login_to_arkhamdb(self):
-        """Open browser for ArkhamDB login"""
-        auth = BrowserAuth(self)
-        
-        # Test authentication with a simple request
-        try:
-            if auth.authenticate():
-                api = ArkhamDBAPI()
-                api.set_browser_auth(auth)  # Pass browser auth for cookie access
-                auth.apply_to_session(api._session)
-                # Try to fetch cards to verify login
-                response = api._session.get(f"{api.BASE_URL}/cards")
-                if response.status_code == 200:
-                    QMessageBox.information(self, "Success", 
-                                      "Successfully logged in to ArkhamDB!")
-                else:
-                    QMessageBox.warning(self, "Login Failed", 
-                                  "Could not access ArkhamDB. Please try logging in again.")
-            else:
-                QMessageBox.warning(self, "Login Cancelled", 
-                              "Login process was cancelled or timed out.")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", 
-                          f"Failed to verify ArkhamDB login: {str(e)}")
+
+    def handle_output_folder_drop(self, folder_path: str):
+        """Update the output folder when the drop button receives a folder."""
+        self._set_output_folder(folder_path)
 
     def select_output_folder(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Select Output Folder", 
-            self.settings.get("last_output_folder", ""))
+            self,
+            "Select Output Folder",
+            self.settings.get("last_output_folder", "")
+        )
         if folder:
-            self.output_folder = folder
-            self.settings.set("last_output_folder", folder)
-            self.settings.add_recent_folder(folder)
-            self.update_recent_menu()
+            self._set_output_folder(folder)
             
     def update_recent_menu(self):
         self.recent_menu.clear()
-        for folder in self.settings.get("recent_folders", []):
+        recent_folders = self.settings.get("recent_folders", [])
+        if not recent_folders:
+            placeholder = self.recent_menu.addAction("No recent folders")
+            placeholder.setEnabled(False)
+            return
+        for folder in recent_folders:
             action = self.recent_menu.addAction(folder)
-            action.triggered.connect(
-                lambda checked, f=folder: self.use_recent_folder(f))
+            action.triggered.connect(lambda checked=False, f=folder: self.use_recent_folder(f))
             
     def use_recent_folder(self, folder):
-        if os.path.exists(folder):
-            self.output_folder = folder
+        if os.path.isdir(folder):
+            self._set_output_folder(folder)
         else:
-            QMessageBox.warning(self, "Folder Not Found",
-                              f"The folder no longer exists:\n{folder}")
+            QMessageBox.warning(
+                self,
+                "Folder Not Found",
+                f"The folder no longer exists:\n{folder}"
+            )
             recent = self.settings.get("recent_folders", [])
-            recent.remove(folder)
-            self.settings.set("recent_folders", recent)
+            if folder in recent:
+                recent.remove(folder)
+                self.settings.set("recent_folders", recent)
             self.update_recent_menu()
+
+    def _set_output_folder(self, folder: str, *, record_recent: bool = True, announce: bool = True):
+        if not folder:
+            return
+        if not os.path.isdir(folder):
+            if announce:
+                QMessageBox.warning(
+                    self,
+                    "Folder Not Found",
+                    f"The folder no longer exists:\n{folder}"
+                )
+            return
+
+        self.output_folder = folder
+        self.settings.set("last_output_folder", folder)
+
+        if record_recent:
+            self.settings.add_recent_folder(folder)
+            self.update_recent_menu()
+
+        self._update_output_folder_button(folder)
+
+        if announce:
+            self.statusBar().showMessage(f"Output folder set to: {folder}", 5000)
+
+    def _update_output_folder_button(self, folder: str | None):
+        if not hasattr(self, "output_folder_button") or self.output_folder_button is None:
+            return
+
+        if folder and os.path.isdir(folder):
+            display_name = os.path.basename(os.path.normpath(folder)) or folder
+            if len(display_name) > 18:
+                display_name = f"{display_name[:17]}..."
+            self.output_folder_button.setText(display_name)
+            self.output_folder_button.setToolTip(folder)
+        else:
+            self.output_folder_button.setText("Output Folder")
+            self.output_folder_button.setToolTip("Click or drop a folder to use as the output location.")
             
     # Removed OCR and tile group management functions as they are no longer needed
 
     def update_export_options(self, option: str, value: any):
-        if not hasattr(self, '_export_options'):
-            self._export_options = {
-                'format': 'JPEG',
-                'jpeg_quality': 85,
-                'webp_quality': 85,
-                'bg_color': '#FFFFFF'
-            }
-        self._export_options[option] = value
+        # This method can be used to respond to export option changes if needed
+        # The export options are accessed directly from the ExportOptions widget
+        pass
 
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -1243,12 +1357,6 @@ class ImageSplitter(QMainWindow):
         self.use_arkhamdb_action.setChecked(self.settings.get("use_arkhamdb", True))
         self.use_arkhamdb_action.triggered.connect(self._toggle_arkhamdb)
         arkhamdb_menu.addAction(self.use_arkhamdb_action)
-        
-        arkhamdb_menu.addSeparator()
-        
-        login_action = QAction("Log in to ArkhamDB...", self)
-        login_action.triggered.connect(self.login_to_arkhamdb)
-        arkhamdb_menu.addAction(login_action)
         
         edit_menu.addMenu(arkhamdb_menu)
 
@@ -1329,10 +1437,8 @@ class ImageSplitter(QMainWindow):
         
         # Get the appropriate quality setting based on format
         quality = None
-        if format_ext == 'jpeg':
-            quality = self._export_options.get('jpeg_quality', 85)
-        elif format_ext == 'webp':
-            quality = self._export_options.get('webp_quality', 85)
+        if format_ext in ['jpeg', 'webp']:
+            quality = self.export_options.quality_spin.value()
         
         format_settings = {
             'format': self.export_options.format_btn.text(),
@@ -1356,19 +1462,25 @@ class ImageSplitter(QMainWindow):
                     right = min(right, img_width)
                     lower = min(lower, img_height)
                     
-                    # Generate filenames
+                    # Generate filenames using custom suffixes
+                    front_suffix = self.front_suffix_input.text().strip()
+                    back_suffix = self.back_suffix_input.text().strip()
+                    
                     tile_name = self.tile_names.get((row, col))
+                    col_str = f"{col + 1:02d}"
+                    row_str = f"{row + 1:02d}"
+                    default_base = f"tile{row_str}-{col_str}"
+
                     if tile_name:
-                        safe_name = "".join(c for c in tile_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                        front_filename = os.path.join(self.output_folder, f"{safe_name}[A].{format_ext}")
-                        if has_back:
-                            back_filename = os.path.join(self.output_folder, f"{safe_name}[B].{format_ext}")
+                        safe_name = self._sanitize_tile_name(tile_name, default_base)
+                        display_name = tile_name
                     else:
-                        col_str = f"{col + 1:02d}"
-                        row_str = f"{row + 1:02d}"
-                        front_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[A].{format_ext}")
-                        if has_back:
-                            back_filename = os.path.join(self.output_folder, f"tile{row_str}-{col_str}[B].{format_ext}")
+                        safe_name = default_base
+                        display_name = default_base
+
+                    front_filename = os.path.join(self.output_folder, f"{safe_name}{front_suffix}.{format_ext}")
+                    if has_back:
+                        back_filename = os.path.join(self.output_folder, f"{safe_name}{back_suffix}.{format_ext}")
 
                     # Process and save front tile
                     front_tile = front_img.crop((left, upper, right, lower))
@@ -1410,7 +1522,25 @@ class ImageSplitter(QMainWindow):
                             if 'icc_profile' in metadata and format_settings['format'] == 'WEBP':
                                 final_save_kwargs['icc_profile'] = metadata['icc_profile']
                     
-                    front_tile_with_meta.save(front_filename, **final_save_kwargs)
+                    try:
+                        front_tile_with_meta.save(front_filename, **final_save_kwargs)
+                    except (OSError, ValueError) as exc:
+                        self.progress.hide()
+                        self.progress.setValue(0)
+                        self.statusBar().showMessage(
+                            f"Save failed for {display_name}: {exc}", 8000
+                        )
+                        QMessageBox.critical(
+                            self,
+                            "Save Error",
+                            (
+                                f"Could not save the front tile for Row {row + 1}, Col {col + 1}.\n\n"
+                                f"Tile name: {display_name}\n"
+                                f"Location: {front_filename}\n\nDetails: {exc}"
+                            ),
+                        )
+                        self._last_failed_tile = (row, col)
+                        return
 
                     # Process and save back tile if needed
                     if has_back:
@@ -1454,7 +1584,25 @@ class ImageSplitter(QMainWindow):
                                 if 'icc_profile' in back_metadata and format_settings['format'] == 'WEBP':
                                     final_back_kwargs['icc_profile'] = back_metadata['icc_profile']
                         
-                        back_tile_with_meta.save(back_filename, **final_back_kwargs)
+                        try:
+                            back_tile_with_meta.save(back_filename, **final_back_kwargs)
+                        except (OSError, ValueError) as exc:
+                            self.progress.hide()
+                            self.progress.setValue(0)
+                            self.statusBar().showMessage(
+                                f"Save failed for {display_name}: {exc}", 8000
+                            )
+                            QMessageBox.critical(
+                                self,
+                                "Save Error",
+                                (
+                                    f"Could not save the back tile for Row {row + 1}, Col {col + 1}.\n\n"
+                                    f"Tile name: {display_name}\n"
+                                    f"Location: {back_filename}\n\nDetails: {exc}"
+                                ),
+                            )
+                            self._last_failed_tile = (row, col)
+                            return
 
                     count += 1
                     self.progress.setValue(count)
@@ -1478,6 +1626,12 @@ class ImageSplitter(QMainWindow):
 if __name__ == "__main__":
     import traceback
     try:
+        log_level_name = os.environ.get("TTSDECK_LOG_LEVEL", "INFO").upper()
+        log_level = getattr(logging, log_level_name, logging.INFO)
+        logging.basicConfig(
+            level=log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        )
         # Enable WebEngine support by setting Qt attribute before QApplication creation
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
         app = QApplication(sys.argv)

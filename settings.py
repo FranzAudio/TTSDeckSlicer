@@ -16,6 +16,10 @@ class Settings:
             "png_bg_color": "#FFFFFF",
             "recent_folders_max": 5,
             "use_arkhamdb": True,  # Default to enabled
+            "front_suffix": "[A]",
+            "back_suffix": "[B]",
+            "include_card_code": True,  # Default to enabled
+            "include_encounter_cards": True,  # Default to enabled
 
             # Removed title region settings as they are no longer used
         }

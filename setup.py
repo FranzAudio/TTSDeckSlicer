@@ -3,7 +3,7 @@ import os
 import sys
 
 # Version and application metadata
-VERSION = "1.3"
+VERSION = "1.4"
 APP_NAME = "TTS Deck Slicer"
 
 # Validate Python version
@@ -58,7 +58,5 @@ setup(
         'PyQt6',
         'Pillow',
         'requests',
-        # Include WebEngine to support embedded login in packaged app
-        'PyQt6-WebEngine',
     ],
 )

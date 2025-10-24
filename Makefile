@@ -7,7 +7,7 @@ PIP = $(VENV)/bin/pip
 
 # Application metadata
 APP_NAME = TTS Deck Slicer
-VERSION = 1.3
+VERSION = 1.4
 
 all: venv clean build sign dmg
 
