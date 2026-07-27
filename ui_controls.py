@@ -1,19 +1,25 @@
+from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtGui import QActionGroup, QColor
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QPushButton,
-    QColorDialog, QSpinBox, QMenu, QFileDialog
+    QColorDialog,
+    QHBoxLayout,
+    QLabel,
+    QMenu,
+    QPushButton,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QActionGroup
 
 
 class ExportOptions(QWidget):
     optionChanged = pyqtSignal(str, object)
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout()
         self.setLayout(layout)
-        
+
         # Quality Control (dynamic label based on format)
         quality_layout = QHBoxLayout()
         self.quality_label = QLabel("JPEG Quality:")
@@ -24,7 +30,7 @@ class ExportOptions(QWidget):
         self.quality_spin.valueChanged.connect(self._on_quality_changed)
         quality_layout.addWidget(self.quality_spin)
         layout.addLayout(quality_layout)
-        
+
         # Background Color
         color_layout = QHBoxLayout()
         color_layout.addWidget(QLabel("PNG Background:"))
@@ -34,7 +40,7 @@ class ExportOptions(QWidget):
         self.color_btn.clicked.connect(self._choose_color)
         color_layout.addWidget(self.color_btn)
         layout.addLayout(color_layout)
-        
+
         # Export Format
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("Format:"))
@@ -42,7 +48,7 @@ class ExportOptions(QWidget):
         self.format_btn.clicked.connect(self._show_format_menu)
         format_layout.addWidget(self.format_btn)
         layout.addLayout(format_layout)
-        
+
         # Initialize quality label based on default format
         self._update_quality_label()
 
@@ -54,8 +60,15 @@ class ExportOptions(QWidget):
 
     def set_color(self, color: QColor):
         self.current_color = color
-        self.color_btn.setStyleSheet(
-            f"background-color: {color.name()}; border: 1px solid black;")
+        self.color_btn.setStyleSheet(f"background-color: {color.name()}; border: 1px solid black;")
+
+    def set_format(self, format_name: str):
+        """Set a supported export format without opening the popup menu."""
+        normalized = format_name.upper()
+        if normalized not in {"JPEG", "PNG", "WEBP"}:
+            normalized = "JPEG"
+        self.format_btn.setText(normalized)
+        self._update_quality_label()
 
     def _on_quality_changed(self, value):
         """Handle quality control changes - emit appropriate signal based on current format"""
@@ -83,15 +96,14 @@ class ExportOptions(QWidget):
         menu = QMenu(self)
         group = QActionGroup(menu)
         group.setExclusive(True)
-        
+
         for fmt in ["JPEG", "PNG", "WEBP"]:
             action = menu.addAction(fmt)
             action.setCheckable(True)
             action.setChecked(fmt == self.format_btn.text())
             group.addAction(action)
-            
-        action = menu.exec(self.format_btn.mapToGlobal(
-            self.format_btn.rect().bottomLeft()))
+
+        action = menu.exec(self.format_btn.mapToGlobal(self.format_btn.rect().bottomLeft()))
         if action:
             self.format_btn.setText(action.text())
             self._update_quality_label()  # Update label when format changes

@@ -1,3 +1,27 @@
+# TTS Deck Slicer v1.5.0 Release Notes
+
+## Reliability and macOS build update
+
+- Restored compatibility with Python 3.9+ and documented Python 3.11 as the
+  recommended development runtime.
+- Repaired the py2app configuration and removed the missing-icon build
+  dependency.
+- Added reproducible runtime/development requirements and standalone versus
+  alias build targets.
+- Added a 20-test automated regression suite and Ruff lint configuration.
+- Added pure, independently tested helpers for grid bounds, filename
+  sanitization, output validation and transparency flattening.
+- Fixed duplicate names that could silently overwrite exported cards.
+- Fixed clicks on the exact image boundary selecting an invalid tile.
+- Reject mismatched full-size back images instead of exporting incorrect crops.
+- Apply the selected PNG background color when flattening transparent images.
+- Persist export format, JPEG/WebP quality, color, templates and all user
+  options across launches.
+- Save settings atomically and recover corrupted settings with a backup.
+- Added ArkhamDB request timeouts and structured logging.
+
+---
+
 # TTS Deck Slicer v1.4 Release Notes
 
 ## 🎯 Major New Features

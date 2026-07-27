@@ -1,6 +1,10 @@
 __pycache__/
+.venv/
 *.pyc
 *.log
+.pytest_cache/
+.ruff_cache/
+.coverage
 *.app/
 dist/
 build/

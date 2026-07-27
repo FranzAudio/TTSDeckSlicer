@@ -1,57 +1,68 @@
 # TTS Deck Slicer
 
-**TTS Deck Slicer** is a powerful desktop app that slices an image into a grid of tiles — perfect for preparing card decks for Tabletop Simulator (TTS) or any virtual tabletop. Features integrated ArkhamDB card search for easy tile naming.
+TTS Deck Slicer is a macOS desktop application that splits deck-sheet images
+into individual cards for Tabletop Simulator and other virtual tabletops.
 
-## ✨ Features
+## Features
 
-- 🖼️ Load standard image formats (JPG, PNG, WebP, BMP, GIF, TIFF)
-- 🔢 Choose number of columns and rows (default 10×7)
-- 🧮 Live preview with grid overlay and zoom lens (hold Alt/Option)
-- 🃏 **ArkhamDB Integration**: Search and select cards from ArkhamDB to name tiles
-- 🔁 Toggle between front/back tiles with flexible back image handling
-- 📁 Export to a chosen folder with customizable naming
-- 🧾 Smart output filenames: `CardName[A].jpg` or `tile03-01[A].jpg`
-- 💾 Undo/Redo functionality for tile naming
-- 📋 Export/Import tile names as CSV
-- 🧱 Built with Python 3 + PyQt6
+- JPG, PNG, WebP, BMP, GIF and TIFF input
+- Configurable grid with live preview and Option-key magnifier
+- Optional front/back and shared-back export
+- JPEG, PNG and WebP output with configurable quality/background
+- Tile naming, CSV import/export and reusable templates
+- Undo/redo history
+- ArkhamDB card search and embedded card metadata
 
-## 🚀 How to Use
+## Requirements
 
-### Basic Usage
+- macOS 11 or newer
+- Python 3.9 or newer (Python 3.11 is recommended)
+- Internet access only for ArkhamDB integration
 
-1. Launch the app
-2. Click or drag & drop to load your front image (and optionally back image)
-3. Adjust the grid size using the column/row spinboxes
-4. Hold **Alt/Option** and move your mouse over the image to see a zoomed preview of tiles
-5. Click on any tile to name it (either manually or via ArkhamDB search)
-6. Select output folder and click **Split Images**
-
-### ArkhamDB Integration
-
-1. Enable ArkhamDB integration via **Edit → ArkhamDB Integration → Enable ArkhamDB Integration**
-2. Click any tile, then use the ArkhamDB search dialog to find the matching card
-3. Filter results with the "Include encounter cards" checkbox when needed
-4. Select a card to autofill the tile name (with optional card code prefix)
-
-**Note**: Spoiler-protected cards still require ArkhamDB authentication, which is not available to third-party applications. The integration provides access to public ArkhamDB cards (1700+) but not spoiler-protected content.
-
-## 🛠️ Development
-
-### Requirements
-
-- Python 3.8+
-- PyQt6
-- Pillow (PIL)
-- requests
-
-### Installation
+## Run from source
 
 ```bash
-pip install PyQt6 Pillow requests
+make venv
+make run
 ```
 
-### Building (macOS)
+The Makefile prefers `python3.11` when available. To choose another interpreter:
 
 ```bash
-python3 setup.py py2app
+make venv PYTHON_BOOTSTRAP=/path/to/python3
 ```
+
+## Tests and lint
+
+```bash
+make test
+make lint
+```
+
+The test suite runs Qt in offscreen mode and covers slicing, all export formats,
+metadata, settings recovery, undo/redo, ArkhamDB failures and important UI
+regressions.
+
+## macOS build
+
+Create a standalone application:
+
+```bash
+make clean
+make build
+```
+
+The result is `dist/TTS Deck Slicer.app`. For a faster development-only alias
+bundle, use `make build-alias`.
+
+To create an ad-hoc signed DMG:
+
+```bash
+make sign
+make dmg
+```
+
+## ArkhamDB limitation
+
+The integration uses ArkhamDB's public API. Spoiler-protected cards requiring
+authentication are not available to third-party applications.

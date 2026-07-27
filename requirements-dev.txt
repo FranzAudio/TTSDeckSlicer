@@ -1,0 +1,4 @@
+-r requirements.txt
+py2app>=0.28.8,<0.29
+pytest>=8,<10
+ruff>=0.9,<1
